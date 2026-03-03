@@ -5,6 +5,7 @@ import basis
 import matplotlib as mpl
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
+from connectivity import InpParser
 
 
 class DofSource(am.Component):
@@ -24,86 +25,6 @@ class DofSource(am.Component):
             self.add_constraint(name)
 
         return
-
-
-class InpParser:
-    def __init__(self):
-        self.elements = {}
-
-    def _read_file(self, filename):
-        with open(filename, "r", errors="ignore") as fp:
-            return [line.rstrip("\n") for line in fp]
-
-    def _split_csv_line(self, s):
-        # ABAQUS lines are simple CSV-like, no quotes typically
-        return [p.strip() for p in s.split(",") if p.strip()]
-
-    def _find_kw(self, header, key):
-        m = re.search(rf"\b{re.escape(key)}\s*=\s*([^,\s]+)", header, flags=re.I)
-        return m.group(1) if m else None
-
-    def parse_inp(self, filename):
-        # Read the entire file in
-        lines = self._read_file(filename)
-
-        self.X = {}
-        self.elem_conn = {}
-
-        elem_type = None
-
-        index = 0
-        section = None
-        while index < len(lines):
-            raw = lines[index].strip()
-            index += 1
-
-            if not raw or raw.startswith("**"):
-                continue
-
-            if raw.startswith("*"):
-                header = raw.upper()
-
-                if header.startswith("*NODE"):
-                    section = "NODE"
-                elif header.startswith("*ELEMENT"):
-                    section = "ELEMENT"
-                    elem_type = self._find_kw(header, "TYPE")
-                    elset = self._find_kw(header, "ELSET")
-                    if elem_type not in self.elem_conn:
-                        self.elem_conn[elset] = {}
-                    if elset not in self.elem_conn[elset]:
-                        self.elem_conn[elset][elem_type] = {}
-                continue
-
-            if section == "NODE":
-                parts = self._split_csv_line(raw)
-                nid = int(parts[0])
-                x = float(parts[1])
-                y = float(parts[2])
-                z = float(parts[3])
-                self.X[nid - 1] = (x, y, z)
-
-            elif section == "ELEMENT":
-                parts = self._split_csv_line(raw)
-                eid = int(parts[0])
-                conn = [(int(p) - 1) for p in parts[1:]]
-                self.elem_conn[elset][elem_type][eid - 1] = conn
-
-    def get_nodes(self):
-        return np.array([self.X[k] for k in sorted(self.X.keys())])
-
-    def get_domains(self):
-        names = {}
-        for elset in self.elem_conn:
-            names[elset] = []
-            for elem_type in self.elem_conn[elset]:
-                names[elset].append(elem_type)
-
-        return names
-
-    def get_conn(self, elset, elem_type):
-        conn = self.elem_conn[elset][elem_type]
-        return np.array([conn[k] for k in sorted(conn.keys())], dtype=int)
 
 
 class DegreesOfFreedom:
@@ -166,6 +87,10 @@ class DegreesOfFreedom:
             return basis.QuadQuadrature(3)
 
         raise NotImplementedError(f"Quadrature for element {etype} not implemented")
+
+    def link_dof(self, model, name, elem_name, conn):
+        model.link(f"src.{name}", f"{elem_name}.{name}", src_indices=conn)
+        return
 
 
 class Mesh:
@@ -258,6 +183,7 @@ class Mesh:
 
 
 class Problem:
+    # soln_space = object
     def __init__(self, mesh, soln_space, weakform, data_space=[], ndim=2):
 
         self.mesh = mesh
@@ -266,16 +192,25 @@ class Problem:
         self.soln_space = soln_space
         self.data_space = data_space
 
+        """Tell the mesh what dof, and basis"""
         if self.ndim == 2:
             self.geo_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
-        elif self.ndim == 3:
-            self.geo_space = basis.SolutionSpace({"x": "H1", "y": "H1", "z": "H1"})
+        # elif self.ndim == 3:
+        #     self.geo_space = basis.SolutionSpace({"x": "H1", "y": "H1", "z": "H1"})
 
         self.weakform = weakform
 
-        self.soln_dof = self.mesh.create_dof(self.mesh, self.soln_space, "soln")
-        self.data_dof = self.mesh.create_dof(self.mesh, self.data_space, "data")
-        self.geo_dof = self.mesh.create_dof(self.mesh, self.geo_space, "geo")
+        # ! Need to implement
+        # Access the connectivity for each space
+        # Initialize the space type for each dof
+        # Stores info about whether the dof is associated H1/Hcurl/Hdiv/L2
+        # self.soln_dof = self.mesh.create_dof(self.soln_space, "soln")
+        # self.data_dof = self.mesh.create_dof(self.data_space, "data")
+        # self.geo_dof = self.mesh.create_dof(self.geo_space, "geo")
+
+        self.soln_dof = DegreesOfFreedom(mesh, "H1", "soln")
+        self.geo_dof = DegreesOfFreedom(mesh, "H1", "geo")
+        self.data_dof = DegreesOfFreedom(mesh, "H1", "data")
 
         return
 
@@ -285,35 +220,52 @@ class Problem:
         model = am.Model(module_name)
 
         # Get the degrees of freedom associated with H1
-        self.soln_dof.add_source(model)
-        self.data_dof.add_source(model)
-        self.geo_dof.add_source(model)
+        # self.soln_dof.add_source(model)
+        # self.data_dof.add_source(model)
+        # self.geo_dof.add_source(model)
 
-        # input_names = self.soln_space.get_names("H1")
-        # data_names = self.data_space.get_names("H1")
-        # geo_names = self.geo_space.get_names("H1")
+        input_names = self.soln_space.get_names("H1")  # rho
+        data_names = self.data_space.get_names("H1")  # x, y
+        geo_names = self.geo_space.get_names("H1")  # x, y
 
-        # Get the number of nodes from the mesh
-        # nnodes = self.mesh.get_num_nodes()
+        # a generalized amigo source component
+        """
+        class DofSource(am.Component):
+            def __init__(self):
+                super().__init__()
 
-        # # Create a node source object for all nodes in the mesh
-        # src = NodeSource(
-        #     input_names=input_names, geo_names=geo_names, data_names=data_names
-        # )
-        # model.add_component("src", nnodes, src)
+                # Filter input values
+                self.add_input("rho")
+                self.add_data("x")
+                self.add_data("y")
+
+        self.dof_src = DofSource()
+        model.add_component("src", nnodes, node_src)
+        """
+        self.dof_src = DofSource(input_names=input_names, geo_names=geo_names)
+        nnodes = mesh.get_num_nodes()
+        model.add_component("src", nnodes, self.dof_src)
 
         # Build the elements for all domains
         domains = self.mesh.get_domains()
         for domain in domains:
             for etype in domains[domain]:
-
+                """
+                helmholtz = Helmholtz()
+                """
                 # Build a finite-element for each weak form
                 elem_name = f"Element{etype}_{domain}"
 
-                # Create the data spaces
-                soln_basis = self.soln_dof.get_basis(etype, kind="input")
-                data_basis = self.data_dof.get_basis(etype, kind="data")
-                geo_basis = self.geo_dof.get_basis(etype, kind="data")
+                # basis.TriangleLagrangeBasis() objects
+                soln_basis = self.soln_dof.get_basis(
+                    etype, "H1", names=["rho"], kind="input"
+                )
+                data_basis = self.data_dof.get_basis(
+                    etype, "H1", names=["x", "y"], kind="data"
+                )
+                geo_basis = self.geo_dof.get_basis(
+                    etype, "H1", names=["x", "y"], kind="data"
+                )
 
                 # Create the quadrature instance
                 quadrature = self.soln_dof.get_quadrature(etype)
@@ -329,19 +281,25 @@ class Problem:
                 )
 
                 # Get the connectivity
+                # Needs to pull out any type of connectivity for the basis
                 conn = self.mesh.get_conn(domain, etype)
 
                 # Add the element/component
                 nelems = conn.shape[0]
+                """
+                model.add_component("helmholtz", nelems, helmholtz)
+                """
                 model.add_component(elem_name, nelems, elem)
 
                 # Link all the element dof to the component
-                self.soln_dof.link_dof(model, elem_name)
-                self.data_dof.link_dof(model, elem_name)
-                self.geo_dof.link_dof(model, elem_name)
-
-                # for name in input_names + data_names + geo_names:
-                #     model.link(f"src.{name}", f"{elem_name}.{name}", src_indices=conn)
+                """
+                model.link("helmholtz.y_coord", "src.y_coord", tgt_indices= self.geo_dof)
+                model.link("helmholtz.x_coord", "src.x_coord", tgt_indices= self.geo_dof)
+                model.link("helmholtz.rho", "src.rho", tgt_indices=self.soln_dof)
+                """
+                self.soln_dof.link_dof(model, "rho", elem_name, conn)
+                self.geo_dof.link_dof(model, "x", elem_name, conn)
+                self.geo_dof.link_dof(model, "y", elem_name, conn)
 
         return model
 
@@ -357,9 +315,17 @@ class FiniteElement(am.Component):
         self.weakform = weakform
 
         # Add the declarations for each basis used in the element
-        self.soln_basis.add_declarations(self)
-        self.data_basis.add_declarations(self)
-        self.geo_basis.add_declarations(self)
+        # Declrations = add inputs, add data etc.
+        # self.soln_basis.add_declarations(self)
+        # self.data_basis.add_declarations(self)
+        # self.geo_basis.add_declarations(self)
+
+        # The x/y coordinates
+        self.add_data("x", shape=(3,))
+        self.add_data("y", shape=(3,))
+
+        # The implicit topology input/output
+        self.add_input("rho", shape=(3,))
 
         # Set the arguments to the compute function for each quadrature point
         self.set_args(self.quadrature.get_args())
@@ -391,29 +357,36 @@ class FiniteElement(am.Component):
 
 
 def weakform(soln, data=None, geo=None):
-    u = soln["u"]
+    print(soln["rho"])
+    u = soln["rho"]
     uvalue = u["value"]
     ugrad = u["grad"]
 
-    v = soln["v"]
-    vvalue = v["value"]
-    vcurl = v["curl"]
+    # u = soln["u"]
+    # uvalue = u["value"]
+    # ugrad = u["grad"]
+
+    # v = soln["v"]
+    # vvalue = v["value"]
+    # vcurl = v["curl"]
 
     x = geo["x"]["value"]
     y = geo["y"]["value"]
-    rho = data["rho"]["value"]
+    # rho = data["rho"]["value"]
 
     f = am.sin(x) ** 2 * am.cos(y) ** 2
 
+    # return 0.5 * (uvalue**2 + basis.dot_product(ugrad, ugrad, n=2) - 2.0 * uvalue * f)
     return 0.5 * (uvalue**2 + basis.dot_product(ugrad, ugrad, n=2) - 2.0 * uvalue * f)
 
 
-soln_space = basis.SolutionSpace({"u": "H1"}, {"v": "H(curl)"})
-data_space = basis.SolutionSpace({"rho": "H1"})
+soln_space = basis.SolutionSpace({"rho": "H1"})
+data_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
 
 # mesh = Mesh("magnet.inp")
-mesh = Mesh("magnet_order_2.inp")
+mesh = Mesh("plate.inp")
 problem = Problem(mesh, soln_space, weakform, data_space=data_space, ndim=2)
+
 model = problem.create_model("test")
 
 # mesh = Mesh("plate.inp")
@@ -429,7 +402,7 @@ model = problem.create_model("test")
 model.build_module()
 model.initialize(order_type=am.OrderingType.NESTED_DISSECTION)
 
-print("num_variables = ", model.num_variables)
+# print("num_variables = ", model.num_variables)
 problem = model.get_problem()
 
 # Set the problem data
@@ -448,6 +421,6 @@ flag = chol.factor()
 print("flag = ", flag)
 chol.solve(rhs.get_vector())
 
-u = rhs["src.u"]
+u = rhs["src.rho"]
 mesh.plot(u)
 plt.show()
