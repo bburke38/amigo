@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 from connectivity import InpParser
 from matplotlib.collections import PolyCollection
+from scipy.sparse.linalg import spsolve
 
 
 class DofSource(am.Component):
@@ -225,11 +226,11 @@ class Problem:
         model = am.Model(module_name)
 
         # Get the names of things associated with H1
-        input_names = self.soln_space.get_names("H1")  # rho
+        input_names = self.soln_space.get_names("H1")  # u, v
         data_names = self.data_space.get_names("H1")  # x, y
         geo_names = self.geo_space.get_names("H1")  # x, y
 
-        # Create amigo component with input names and geo names
+        # Create amigo source component with input names and geo names
         self.dof_src = DofSource(input_names=input_names, geo_names=geo_names)
 
         # Add global mesh source component
@@ -243,9 +244,14 @@ class Problem:
                 # Build a finite-element for each weak form
                 elem_name = f"Element{etype}_{domain}"
 
-                soln_basis = self.soln_dof.get_basis(
+                soln_basis_u = self.soln_dof.get_basis(
                     etype, "H1", names=input_names, kind="input"
                 )
+
+                soln_basis_v = self.soln_dof.get_basis(
+                    etype, "H1", names=input_names, kind="input"
+                )
+
                 data_basis = self.data_dof.get_basis(
                     etype, "H1", names=data_names, kind="data"
                 )
@@ -259,7 +265,7 @@ class Problem:
                 # Create the element object
                 elem = FiniteElement(
                     elem_name,
-                    soln_basis,
+                    [soln_basis_u, soln_basis_v],
                     data_basis,
                     geo_basis,
                     quadrature,
@@ -304,7 +310,8 @@ class FiniteElement(am.Component):
     ):
         super().__init__(name=name)
 
-        self.soln_basis = soln_basis
+        self.soln_basis_u = soln_basis[0]
+        self.soln_basis_v = soln_basis[1]
         self.data_basis = data_basis
         self.geo_basis = geo_basis
         self.quadrature = quadrature
@@ -342,46 +349,76 @@ class FiniteElement(am.Component):
 
         quad_weight, quad_point = self.quadrature.get_point(**args)
 
-        # Evaluate the solution fields/data fields
-        soln_xi = self.soln_basis.eval(self, quad_point)
-        data_xi = self.data_basis.eval(self, quad_point)
-        geo = self.geo_basis.eval(self, quad_point)
+        # Evaluate the solution fields/data fields (u)
+        soln_xi_u = self.soln_basis_u.eval(self, quad_point)
+        data_xi_u = self.data_basis.eval(self, quad_point)
+        geo_u = self.geo_basis.eval(self, quad_point)
 
-        # Perform the mapping from computational to physical coordinates
-        detJ, Jinv = self.geo_basis.compute_transform(geo)
-        soln_phys = self.soln_basis.transform(detJ, Jinv, soln_xi)
-        data_phys = self.data_basis.transform(detJ, Jinv, data_xi)
+        # Perform the mapping from computational to physical coordinates (u)
+        detJ_u, Jinv_u = self.geo_basis.compute_transform(geo_u)
+        soln_phys_u = self.soln_basis_u.transform(detJ_u, Jinv_u, soln_xi_u)
+        data_phys_u = self.data_basis.transform(detJ_u, Jinv_u, data_xi_u)
+
+        # Evaluate the solution fields/data fields (v)
+        soln_xi_v = self.soln_basis_v.eval(self, quad_point)
+        data_xi_v = self.data_basis.eval(self, quad_point)
+        geo_v = self.geo_basis.eval(self, quad_point)
+
+        # Perform the mapping from computational to physical coordinates (u)
+        detJ_v, Jinv_v = self.geo_basis.compute_transform(geo_v)
+        soln_phys_v = self.soln_basis_v.transform(detJ_v, Jinv_v, soln_xi_v)
+        data_phys_v = self.data_basis.transform(detJ_v, Jinv_v, data_xi_v)
 
         # Add the contributions directly to the Lagrangian
         self.objective["obj"] = (
-            quad_weight * detJ * self.weakform(soln_phys, data=data_phys, geo=geo)
+            quad_weight
+            * detJ_u
+            * self.weakform(soln_phys_u, soln_phys_v, data=data_phys_u, geo=geo_u)
         )
 
         return
 
 
-def weakform(soln, data=None, geo=None):
-    u = soln["u"]
+def weakform(soln_u, soln_v, data=None, geo=None):
+    u = soln_u["u"]
     uvalue = u["value"]
     ugrad = u["grad"]
 
-    # u = soln["u"]
-    # uvalue = u["value"]
-    # ugrad = u["grad"]
-
-    # v = soln["v"]
-    # vvalue = v["value"]
-    # vcurl = v["curl"]
+    v = soln_v["v"]
+    vvalue = v["value"]
+    vgrad = v["grad"]
 
     x = geo["x"]["value"]
     y = geo["y"]["value"]
-    # rho = data["rho"]["value"]
 
-    f = am.sin(x) ** 2 * am.cos(y) ** 2
-    return 0.5 * (uvalue**2 + basis.dot_product(ugrad, ugrad, n=2) - 2.0 * uvalue * f)
+    # f = am.sin(x) ** 2 * am.cos(y) ** 2
+    # comp1 = 0.5 * (uvalue**2 + basis.dot_product(ugrad, vgrad, n=2) - 2.0 * uvalue * f)
+
+    alpha = 1.0
+    pi = 3.14159265358979
+
+    # Manufactured RHS derived from exact solution
+    # u_exact = sin(πx)sin(πy)  →  -Δu_exact = 2π²·sin(πx)sin(πy)
+    # v_exact = cos(πx)cos(πy)  →  -Δv_exact = 2π²·cos(πx)cos(πy)
+    f1 = 2 * pi**2 * am.sin(pi * x) * am.sin(pi * y) + alpha * am.cos(
+        pi * x
+    ) * am.cos(pi * y)
+    f2 = 2 * pi**2 * am.cos(pi * x) * am.cos(pi * y) + alpha * am.sin(
+        pi * x
+    ) * am.sin(pi * y)
+
+    comp1 = (
+        basis.dot_product(ugrad, vgrad, n=2)
+        + alpha * vvalue * uvalue
+        - f1 * uvalue
+        + basis.dot_product(vgrad, ugrad, n=2)
+        + alpha * uvalue * vvalue
+        - f2 * vvalue
+    )
+    return comp1
 
 
-soln_space = basis.SolutionSpace({"u": "H1"})
+soln_space = basis.SolutionSpace({"u": "H1", "v": "H1"})
 data_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
 geo_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
 
@@ -409,17 +446,35 @@ data = model.get_data_vector()
 data["src.x"] = mesh.X[:, 0]
 data["src.y"] = mesh.X[:, 1]
 
-x = problem.create_vector()
+# x = problem.create_vector()
+# mat = problem.create_matrix()
+# rhs = model.create_vector()
+# problem.gradient(1.0, x, rhs.get_vector())
+# problem.hessian(1.0, x, mat)
+
+# chol = am.SparseCholesky(mat)
+# flag = chol.factor()
+# print("flag = ", flag)
+# chol.solve(rhs.get_vector())
+
 mat = problem.create_matrix()
-rhs = model.create_vector()
-problem.gradient(1.0, x, rhs.get_vector())
-problem.hessian(1.0, x, mat)
+alpha = 1.0
+x = problem.create_vector()
+ans = problem.create_vector()
+g = problem.create_vector()
+rhs = problem.create_vector()
+problem.hessian(alpha, x, mat)
+problem.gradient(alpha, x, g)
+csr_mat = am.tocsr(mat)
 
-chol = am.SparseCholesky(mat)
-flag = chol.factor()
-print("flag = ", flag)
-chol.solve(rhs.get_vector())
+ans.get_array()[:] = spsolve(csr_mat, g.get_array())
+ans_local = ans
+u = ans_local.get_array()[model.get_indices("src.u")]
+v = ans_local.get_array()[model.get_indices("src.v")]
+print(u)
+print(v)
 
-u = rhs["src.u"]
-mesh.plot(u)
+fig, ax = plt.subplots(ncols=2)
+mesh.plot(u, ax=ax[0])
+mesh.plot(v, ax=ax[1])
 plt.show()
