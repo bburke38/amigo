@@ -11,13 +11,11 @@ from scipy.sparse.linalg import spsolve
 
 
 class DofSource(am.Component):
-    def __init__(self, input_names=[], geo_names=[], data_names=[], con_names=[]):
+    def __init__(self, input_names=[], data_names=[], con_names=[]):
         super().__init__()
 
         # Geo and data added as data to the component
         for name in data_names:
-            self.add_data(name)
-        for name in geo_names:
             self.add_data(name)
 
         # Add inputs and constraints
@@ -30,7 +28,7 @@ class DofSource(am.Component):
 
 
 class DegreesOfFreedom:
-    def __init__(self, mesh, space, kind="input"):
+    def __init__(self, mesh, space, kind="input", name="src"):
         """
         Allocate the degrees of freedom on the mesh
         """
@@ -38,15 +36,7 @@ class DegreesOfFreedom:
         self.mesh = mesh
         self.space = space
         self.kind = kind
-
-        return
-
-    def _initialize(self):
-        """
-        Initialize the degrees of freedom associated with this mesh
-        """
-
-        # Allocate degrees of freedom for each of the nodes/
+        self.name = name
 
         return
 
@@ -56,29 +46,25 @@ class DegreesOfFreedom:
 
         # Create amigo source component with input names and geo names
         input_names = []
-        geo_names = []
         data_names = []
         if self.kind == "input":
             input_names = names
         elif self.kind == "data":
             data_names = names
-        elif self.kind == "geo":
-            geo_names = names
 
-        dof_src = DofSource(
-            input_names=input_names, geo_names=geo_names, data_names=data_names
-        )
+        dof_src = DofSource(input_names=input_names, data_names=data_names)
 
         # Add global mesh source component
         nnodes = mesh.get_num_nodes()
-        model.add_component(f"src_{self.kind}", nnodes, dof_src)
+        model.add_component(f"src_{self.name}", nnodes, dof_src)
+        # src_soln, src_data, src_geo
 
     def link_dof(self, model, domain, etype, elem_name):
         names = self.space.get_names("H1")
         conn = self.mesh.get_conn(domain, etype)
         for name in names:
             model.link(
-                f"src_{self.kind}.{name}", f"{elem_name}.{name}", src_indices=conn
+                f"src_{self.name}.{name}", f"{elem_name}.{name}", src_indices=conn
             )
         return
 
@@ -246,9 +232,13 @@ class Problem:
 
         # Initialize Dof's
         # Take in the soln space -> removes "H1" input
-        self.soln_dof = DegreesOfFreedom(mesh, self.soln_space, "soln")
-        self.geo_dof = DegreesOfFreedom(mesh, self.geo_space, "geo")
-        self.data_dof = DegreesOfFreedom(mesh, self.data_space, "data")
+        self.soln_dof = DegreesOfFreedom(
+            mesh, self.soln_space, kind="input", name="soln"
+        )
+        self.geo_dof = DegreesOfFreedom(mesh, self.geo_space, kind="data", name="geo")
+        self.data_dof = DegreesOfFreedom(
+            mesh, self.data_space, kind="data", name="data"
+        )
 
         return
 
@@ -311,9 +301,7 @@ class FiniteElement(am.Component):
     ):
         super().__init__(name=name)
 
-        # NOTE: soln_basis is a dict of objectes for each input
         self.soln_basis = soln_basis
-
         self.data_basis = data_basis
         self.geo_basis = geo_basis
         self.quadrature = quadrature
@@ -352,14 +340,12 @@ class FiniteElement(am.Component):
 
 
 def weakform(soln, data=None, geo=None):
-    soln_u = soln["u"]
-    soln_v = soln["v"]
+    u = soln["u"]
+    v = soln["v"]
 
-    u = soln_u["u"]
     uvalue = u["value"]
     ugrad = u["grad"]
 
-    v = soln_v["v"]
     vvalue = v["value"]
     vgrad = v["grad"]
 
@@ -367,7 +353,7 @@ def weakform(soln, data=None, geo=None):
     y = geo["y"]["value"]
 
     # f = am.sin(x) ** 2 * am.cos(y) ** 2
-    # comp1 = 0.5 * (uvalue**2 + basis.dot_product(ugrad, vgrad, n=2) - 2.0 * uvalue * f)
+    # comp1 = 0.5 * (uvalue**2 + basis.dot_product(ugrad, ugrad, n=2) - 2.0 * uvalue * f)
 
     alpha = 1.0
     pi = 3.14159265358979
@@ -380,11 +366,11 @@ def weakform(soln, data=None, geo=None):
     ) * am.sin(pi * y)
 
     comp1 = (
-        basis.dot_product(ugrad, vgrad, n=2)
-        + alpha * vvalue * uvalue
+        basis.dot_product(ugrad, ugrad, n=2)
+        + alpha * uvalue * uvalue
         + f1 * uvalue
-        + basis.dot_product(vgrad, ugrad, n=2)
-        + alpha * uvalue * vvalue
+        + basis.dot_product(vgrad, vgrad, n=2)
+        + alpha * vvalue * vvalue
         + f2 * vvalue
     )
     return comp1
@@ -392,11 +378,11 @@ def weakform(soln, data=None, geo=None):
 
 # Initialize the spaces
 soln_space = basis.SolutionSpace({"u": "H1", "v": "H1"})
-data_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
+data_space = basis.SolutionSpace({"rho": "H1"})
 geo_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
 
-# mesh = Mesh("magnet_order_1.inp")
-mesh = Mesh("plate.inp")
+mesh = Mesh("magnet_order_1.inp")
+# mesh = Mesh("plate.inp")
 problem = Problem(
     mesh,
     soln_space,
@@ -416,8 +402,8 @@ problem = model.get_problem()
 
 # Set the problem data
 data = model.get_data_vector()
-data["src.x"] = mesh.X[:, 0]
-data["src.y"] = mesh.X[:, 1]
+data["src_geo.x"] = mesh.X[:, 0]
+data["src_geo.y"] = mesh.X[:, 1]
 
 # x = problem.create_vector()
 # mat = problem.create_matrix()
@@ -442,8 +428,8 @@ csr_mat = am.tocsr(mat)
 
 ans.get_array()[:] = spsolve(csr_mat, g.get_array())
 ans_local = ans
-u = ans_local.get_array()[model.get_indices("src.u")]
-v = ans_local.get_array()[model.get_indices("src.v")]
+u = ans_local.get_array()[model.get_indices("src_soln.u")]
+v = ans_local.get_array()[model.get_indices("src_soln.v")]
 print(u)
 print(v)
 

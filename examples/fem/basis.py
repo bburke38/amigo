@@ -85,6 +85,9 @@ class BasisCollection:
             soln.update(basis.transform(detJ, Jinv, orig))
         return soln
 
+    def compute_transform(self, geo):
+        return self.basis[0].compute_transform(geo)
+
 
 class Basis:
     def __init__(self, names, nnodes=1, kind="input"):
@@ -94,6 +97,9 @@ class Basis:
             self.names = [names]
         self.nnodes = nnodes
         self.kind = kind
+
+        if not (self.kind == "input" or self.kind == "data"):
+            raise ValueError(f"{self.kind} not recognized")
 
     def add_declarations(self, comp):
         """Add the declarations to the component"""
@@ -390,4 +396,7 @@ class SolutionSpace:
         return list(self.names.keys())
 
     def get_names(self, space):
-        return self.names[space]
+        if space in self.names:
+            return self.names[space]
+        else:
+            return []
