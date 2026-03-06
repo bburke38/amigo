@@ -9,6 +9,10 @@ def dot_product(x, y, n=1):
     return val
 
 
+def curl_2d(x, y, n=1):
+    return x[0] * y[1] - x[1] * y[0]
+
+
 def mat_vec(A, x, m=1, n=1):
     return [A[0][0] * x[0] + A[0][1] * x[1], A[1][0] * x[0] + A[1][1] * x[1]]
 

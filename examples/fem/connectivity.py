@@ -122,6 +122,17 @@ class InpParser:
         conn = self.elem_conn[elset][elem_type]
         return np.array([conn[k] for k in sorted(conn.keys())], dtype=int)
 
+    def get_edge_node(self, elset, elem_type):
+        if elem_type == "T3D2":
+            conn = self.get_conn(elset, elem_type)
+        else:
+            raise NotImplementedError(f"{elem_type} not valid")
+
+        # Turn into a single unique list of nodes preserving GMSH ordering
+        node_tags_list = np.array(list(dict.fromkeys(conn.flatten())))
+
+        return node_tags_list
+
     def get_conn_edges(self, elset, elem_type):
         """
         Build a unique-edge connectivity dictionary for the given elset/element type.

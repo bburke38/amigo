@@ -27,6 +27,73 @@ class DofSource(am.Component):
         return
 
 
+class DirichletBCSource(am.Component):
+    def __init__(self, input_name=[]):
+        super().__init__()
+
+        self.input_name = input_name
+
+        for name in self.input_name:
+            self.add_input(name, value=1.0)
+        self.add_input("lam", value=1.0)
+        self.add_objective("obj")
+        return
+
+    def compute(self):
+        for name in self.input_name:
+            self.objective["obj"] = self.inputs[name] * self.inputs["lam"]
+        return
+
+
+class DirichletDegreesOfFreedom:
+    def __init__(self, mesh, bc={}):
+        self.mesh = mesh
+        self.bc = bc
+        return
+
+    def add_bc_source(self, model):
+        names = self.bc.keys()
+        for name in names:
+            # Loop through each bc_type name
+            bc_src = DirichletBCSource(input_name=self.bc[name]["input"])
+            nnodes = mesh.get_num_nodes_on_bc(name, "T3D2")
+
+            # Update the number of components based on whether to include start and end
+            if self.bc[name]["start"] == False:
+                nnodes -= 1
+            if self.bc[name]["end"] == False:
+                nnodes -= 1
+
+            model.add_component(
+                f"src_{name}",
+                nnodes,
+                bc_src,
+            )
+        return
+
+    def link_bc_dof(self, model):
+        names = self.bc.keys()
+        for name in names:
+            # Loop through each bc_type name
+            input_name = self.bc[name]["input"][0]  # Extract "u"
+            conn = mesh.get_bc_nodes(name, "T3D2")
+
+            # Slice the nodes based on start and end requirement
+            if self.bc[name]["start"] == False and self.bc[name]["end"] == True:
+                conn = conn[1:]
+            elif self.bc[name]["start"] == False and self.bc[name]["end"] == False:
+                conn = conn[1:-1]
+            elif self.bc[name]["start"] == True and self.bc[name]["end"] == False:
+                conn = conn[0:-1]
+
+            model.link(
+                f"src_soln.{input_name}",
+                f"src_{name}.{input_name}",
+                src_indices=conn,
+            )
+        return
+
+
 class DegreesOfFreedom:
     def __init__(self, mesh, space, kind="input", name="src"):
         """
@@ -138,6 +205,12 @@ class Mesh:
     def get_num_elements(self, name, etype):
         return self.parser.get_conn(name, etype).shape[0]
 
+    def get_bc_nodes(self, name, etype):
+        return self.parser.get_edge_node(name, etype)
+
+    def get_num_nodes_on_bc(self, name, etype):
+        return self.parser.get_edge_node(name, etype).shape[0]
+
     def plot(self, u, ax=None, nlevels=30, cmap="coolwarm", title=None):
         min_level = np.min(u)
         max_level = np.max(u)
@@ -217,10 +290,18 @@ class Mesh:
         return np.vstack(cs)
 
 
+# Needs to take in bcs here
 class Problem:
     # soln_space = object
     def __init__(
-        self, mesh, soln_space, weakform_map={}, data_space=[], geo_space=[], ndim=2
+        self,
+        mesh,
+        soln_space,
+        weakform_map={},
+        data_space=[],
+        geo_space=[],
+        bc_map={},
+        ndim=2,
     ):
 
         self.mesh = mesh
@@ -231,15 +312,31 @@ class Problem:
         self.geo_space = geo_space
 
         self.weakform_map = weakform_map
+        self.bc_map = bc_map
 
         # Initialize Dof's
         # Take in the soln space -> removes "H1" input
         self.soln_dof = DegreesOfFreedom(
-            mesh, self.soln_space, kind="input", name="soln"
+            mesh,
+            self.soln_space,
+            kind="input",
+            name="soln",
         )
-        self.geo_dof = DegreesOfFreedom(mesh, self.geo_space, kind="data", name="geo")
+        self.geo_dof = DegreesOfFreedom(
+            mesh,
+            self.geo_space,
+            kind="data",
+            name="geo",
+        )
         self.data_dof = DegreesOfFreedom(
-            mesh, self.data_space, kind="data", name="data"
+            mesh,
+            self.data_space,
+            kind="data",
+            name="data",
+        )
+        self.bc_dof = DirichletDegreesOfFreedom(
+            self.mesh,
+            self.bc_map,
         )
 
         return
@@ -287,6 +384,10 @@ class Problem:
                 self.soln_dof.link_dof(model, domain, etype, elem_name)
                 self.data_dof.link_dof(model, domain, etype, elem_name)
                 self.geo_dof.link_dof(model, domain, etype, elem_name)
+
+        # Add BC components and links
+        self.bc_dof.add_bc_source(model)
+        self.bc_dof.link_bc_dof(model)
 
         return model
 
@@ -378,7 +479,7 @@ def weakform(soln, data=None, geo=None):
     return comp1
 
 
-def weakform_1(soln, data=None, geo=None):
+def weakform_air(soln, data=None, geo=None):
     u = soln["u"]
     uvalue = u["value"]
     ugrad = u["grad"]
@@ -386,12 +487,11 @@ def weakform_1(soln, data=None, geo=None):
     x = geo["x"]["value"]
     y = geo["y"]["value"]
 
-    f = am.sin(x) ** 2 * am.cos(y) ** 2
-    wf = 0.5 * (uvalue**2 + basis.dot_product(ugrad, ugrad, n=2) - 2.0 * uvalue * f)
+    wf = 0.5 * (basis.dot_product(ugrad, ugrad, n=2))
     return wf
 
 
-def weakform_2(soln, data=None, geo=None):
+def weakform_NS_Magnet(soln, data=None, geo=None):
     u = soln["u"]
     uvalue = u["value"]
     ugrad = u["grad"]
@@ -399,16 +499,59 @@ def weakform_2(soln, data=None, geo=None):
     x = geo["x"]["value"]
     y = geo["y"]["value"]
 
-    f = am.sin(x) ** 2 * am.cos(y) ** 2
-    wf = 0.5 * (uvalue**2 + basis.dot_product(ugrad, ugrad, n=2) - 2.0 * uvalue * f)
+    M = [0.0, 1.0]
+    f = basis.curl_2d(ugrad, M, n=2)
+    wf = 0.5 * (basis.dot_product(ugrad, ugrad, n=2) - f)
+    return wf
+
+
+def weakform_SN_Magnet(soln, data=None, geo=None):
+    u = soln["u"]
+    uvalue = u["value"]
+    ugrad = u["grad"]
+
+    x = geo["x"]["value"]
+    y = geo["y"]["value"]
+
+    M = [0.0, -1.0]
+    f = basis.curl_2d(ugrad, M, n=2)
+    wf = 0.5 * (basis.dot_product(ugrad, ugrad, n=2) - f)
     return wf
 
 
 # Define a weakform map to domains
 weakform_map = {
-    "SURFACE1": weakform_1,
-    "SURFACE2": weakform_2,
-    "SURFACE3": weakform_2,
+    "SURFACE1": weakform_air,
+    "SURFACE2": weakform_NS_Magnet,
+    "SURFACE3": weakform_SN_Magnet,
+}
+
+# Boundary Condition
+bc_map = {
+    "LINE1": {
+        "type": "dirichlet",
+        "input": ["u"],
+        "start": True,
+        "end": True,
+    },
+    "LINE2": {
+        "type": "dirichlet",
+        "input": ["u"],
+        "start": False,
+        "end": False,
+    },
+    "LINE3": {
+        "type": "dirichlet",
+        "input": ["u"],
+        "start": True,
+        "end": True,
+    },
+    "LINE4": {
+        "type": "dirichlet",
+        "input": ["u"],
+        "start": False,
+        "end": False,
+    },
 }
 
 # Initialize the spaces
@@ -424,6 +567,7 @@ problem = Problem(
     weakform_map,
     data_space=data_space,
     geo_space=geo_space,
+    bc_map=bc_map,
     ndim=2,
 )
 
