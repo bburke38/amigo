@@ -638,52 +638,52 @@ slide_number = 10
 x_offset = slide_number * (5.0 / npts_shared)
 
 # Define a weakform map to domains
-weakform_map_domain_0 = {
-    "name": "Mesh0_weak_forms",
-    "SURFACE1": weakform_air,
-    "SURFACE2": weakform_air,
-    "SURFACE3": weakform_NS_Magnet,
-}
+# weakform_map_domain_0 = {
+#     "name": "Mesh0_weak_forms",
+#     "SURFACE1": weakform_air,
+#     "SURFACE2": weakform_air,
+#     "SURFACE3": weakform_NS_Magnet,
+# }
 
-weakform_map_domain_1 = {
-    "name": "Mesh1_weak_forms",
-    "SURFACE1": weakform_air,
-    "SURFACE2": weakform_NS_Magnet,
-    "SURFACE3": weakform_air,
-}
+# weakform_map_domain_1 = {
+#     "name": "Mesh1_weak_forms",
+#     "SURFACE1": weakform_air,
+#     "SURFACE2": weakform_NS_Magnet,
+#     "SURFACE3": weakform_air,
+# }
 
 # Boundary Condition
-dirichlet_bc_map_domain_1 = {
-    "DirichletLine3": {
-        "type": "dirichlet",
-        "target": "LINE3",
-        "input": ["u"],
-        "start": True,
-        "end": True,
-    },
-}
+# dirichlet_bc_map_domain_1 = {
+#     "DirichletLine3": {
+#         "type": "dirichlet",
+#         "target": "LINE3",
+#         "input": ["u"],
+#         "start": True,
+#         "end": True,
+#     },
+# }
 
-dirichlet_bc_map_domain_2 = {
-    "DirichletLine1": {
-        "type": "dirichlet",
-        "target": "LINE1",
-        "input": ["u"],
-        "start": True,
-        "end": True,
-    },
-}
+# dirichlet_bc_map_domain_2 = {
+#     "DirichletLine1": {
+#         "type": "dirichlet",
+#         "target": "LINE1",
+#         "input": ["u"],
+#         "start": True,
+#         "end": True,
+#     },
+# }
 
 # Lucky case: symm line tags are the same for both mesh
-symmetery_bc_map = {
-    "symm": {
-        "input": ["u"],
-        "start": False,
-        "end": False,
-        "target": ["LINE2", "LINE4"],
-        "flip": [False, False],
-        "scale": [1.0, 1.0],
-    },
-}
+# symmetery_bc_map = {
+#     "symm": {
+#         "input": ["u"],
+#         "start": False,
+#         "end": False,
+#         "target": ["LINE2", "LINE4"],
+#         "flip": [False, False],
+#         "scale": [1.0, 1.0],
+#     },
+# }
 
 # Define mesh objects
 meshes = {
@@ -693,14 +693,64 @@ meshes = {
 
 # Define Dirichlet BCs for each mesh
 dirichlet_bc_meshes = {
-    "Mesh0": dirichlet_bc_map_domain_1,
-    "Mesh1": dirichlet_bc_map_domain_2,
+    "Mesh0": {
+        "DirichletLine3": {
+            "type": "dirichlet",
+            "target": "LINE3",
+            "input": ["u"],
+            "start": True,
+            "end": True,
+        },
+    },
+    "Mesh1": {
+        "DirichletLine1": {
+            "type": "dirichlet",
+            "target": "LINE1",
+            "input": ["u"],
+            "start": True,
+            "end": True,
+        },
+    },
+}
+
+# Symmetric BCs mapping for each mesh
+symm_bc_meshes = {
+    "Mesh0": {
+        "SymmMesh0": {
+            "input": ["u"],
+            "start": False,
+            "end": False,
+            "target": ["LINE2", "LINE4"],
+            "flip": [False, False],
+            "scale": [1.0, 1.0],
+        },
+    },
+    "Mesh1": {
+        "SymmMesh1": {
+            "input": ["u"],
+            "start": False,
+            "end": False,
+            "target": ["LINE2", "LINE4"],
+            "flip": [False, False],
+            "scale": [1.0, 1.0],
+        },
+    },
 }
 
 # Weak form mapping for each mesh
 weakform_map = {
-    "Mesh0": weakform_map_domain_0,
-    "Mesh1": weakform_map_domain_1,
+    "Mesh0": {
+        "name": "Mesh0_weak_forms",
+        "SURFACE1": weakform_air,
+        "SURFACE2": weakform_air,
+        "SURFACE3": weakform_NS_Magnet,
+    },
+    "Mesh1": {
+        "name": "Mesh1_weak_forms",
+        "SURFACE1": weakform_air,
+        "SURFACE2": weakform_NS_Magnet,
+        "SURFACE3": weakform_air,
+    },
 }
 
 # Initialize the spaces (same for all domains)
@@ -720,7 +770,7 @@ for mesh_name, mesh in meshes.items():
         data_space=data_space,
         geo_space=geo_space,
         dirichlet_bc_map=dirichlet_bc_meshes[mesh_name],
-        sym_bc_map=symmetery_bc_map,
+        sym_bc_map=symm_bc_meshes[mesh_name],
         ndim=2,
     )
     model = problem.create_model(mesh_name)
