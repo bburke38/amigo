@@ -104,10 +104,14 @@ for i, lc in enumerate(lc_vals):
 
     # Weak form mapping for each mesh
     weakform_map = {
-        "Mesh": {
-            "name": "mms_wf",
-            "SURFACE1": weakform,
-        },
+        "mms": {
+            "target": ["SURFACE1"],
+            "weakform": weakform,
+        }
+    }
+
+    wf_mesh_map = {
+        "Mesh": weakform_map,
     }
     output_map = {
         "Mesh": {
@@ -141,13 +145,10 @@ for i, lc in enumerate(lc_vals):
         problem = Problem(
             mesh,
             soln_space,
-            weakform_map[mesh_name],
-            output_map[mesh_name],
-            data_space=data_space,
-            geo_space=geo_space,
+            data_space,
+            geo_space,
+            weakform_map=wf_mesh_map[mesh_name],
             dirichlet_bc_map=dirichlet_bc_meshes[mesh_name],
-            sym_bc_map=symm_bc_meshes[mesh_name],
-            ndim=2,
         )
         model = problem.create_model(mesh_name)
         global_model.add_model(mesh_name, model)

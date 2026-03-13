@@ -394,7 +394,7 @@ class Mesh:
                     ax.set_title(title)
 
                 ax.set_aspect("equal")
-                fig.colorbar(cntr, ax=ax)
+                # fig.colorbar(cntr, ax=ax)
         return ax
 
     def convert_conn(self, etype, conn):
@@ -439,18 +439,15 @@ class Problem:
     def __init__(
         self,
         mesh,
-        soln_space,
+        soln_space: basis.SolutionSpace,
+        data_space: basis.SolutionSpace,
+        geo_space: basis.SolutionSpace,
         weakform_map={},
         output_map={},
-        data_space=[],
-        geo_space=[],
         dirichlet_bc_map={},
         sym_bc_map={},
-        ndim=2,
     ):
         self.mesh = mesh
-        self.ndim = ndim  # Dimension of the problem
-
         self.soln_space = soln_space
         self.data_space = data_space
         self.geo_space = geo_space
@@ -502,18 +499,30 @@ class Problem:
         self.soln_dof.add_source(model)
         self.data_dof.add_source(model)
         self.geo_dof.add_source(model)
+        # self.output_dof.add_source(model)
 
-        # Build the elements for all domains
+        # Get the domain names from the mesh
         domains = self.mesh.get_domains()
-        wf_name = self.weakform_map["name"]
-        for domain in domains:
-            for etype in domains[domain]:
-                # Each element type has a dictionary of solution basis's
-                soln_basis = {}
 
-                # Build a finite-element for each weak form
-                elem_name = f"{wf_name}_Element{etype}_{domain}"
+        # Figure out which elements need to be created to go with this weak form
+        element_objs = {}
+        for weakform_name in self.weakform_map:
+            targets = self.weakform_map[weakform_name]["target"]
+            weakform = self.weakform_map[weakform_name]["weakform"]
 
+            # Figure out the element types that we need
+            etypes = []
+            for target in targets:
+                for etype in domains[target]:
+                    if not etype in etypes:
+                        etypes.append(etype)
+
+            # Loop over the element types for this weakform
+            for etype in etypes:
+                # Set the element name
+                elem_name = f"Element{weakform_name}{etype}"
+
+                # Get the basis objects for the element type
                 soln_basis = self.soln_dof.get_basis(etype)
                 data_basis = self.data_dof.get_basis(etype)
                 geo_basis = self.geo_dof.get_basis(etype)
@@ -522,23 +531,30 @@ class Problem:
                 quadrature = self.soln_dof.get_quadrature(etype)
 
                 # Create the element object
-                elem = FiniteElement(
-                    elem_name,
-                    soln_basis,
-                    data_basis,
-                    geo_basis,
-                    quadrature,
-                    self.weakform_map[domain],
+                obj = FiniteElement(
+                    elem_name, soln_basis, data_basis, geo_basis, quadrature, weakform
                 )
 
-                # Add the element/component
-                nelems = self.mesh.get_num_elements(domain, etype)
-                model.add_component(elem_name, nelems, elem)
+                # Set this into the element dictionary
+                element_objs[(weakform_name, etype)] = obj
 
-                # Link all the element dof to the component
-                self.soln_dof.link_dof(model, domain, etype, elem_name)
-                self.data_dof.link_dof(model, domain, etype, elem_name)
-                self.geo_dof.link_dof(model, domain, etype, elem_name)
+        # Add the element component objects
+        for weakform_name in self.weakform_map:
+            targets = self.weakform_map[weakform_name]["target"]
+
+            for target in targets:
+                for etype in domains[target]:
+                    elem = element_objs[(weakform_name, etype)]
+                    comp_name = f"Element{weakform_name}{etype}{target}"
+
+                    # Add the element/component
+                    nelems = self.mesh.get_num_elements(target, etype)
+                    model.add_component(comp_name, nelems, elem)
+
+                    # Link all the element dof to the component
+                    self.soln_dof.link_dof(model, target, etype, comp_name)
+                    self.data_dof.link_dof(model, target, etype, comp_name)
+                    self.geo_dof.link_dof(model, target, etype, comp_name)
 
         # Add BC components and links
         self.dirichlet_bc_dof.add_bc_source(model)
@@ -548,37 +564,62 @@ class Problem:
         self.sym_bc_dof.add_bc_source(model)
         self.sym_bc_dof.link_bc_dof(model)
 
-        # Output loop
-        for output_name in self.output_map.keys():
-            for domain in domains:
-                # Loop through each domain
-                for etype in domains[domain]:
-                    # Each element type has a dictionary of solution basis's
-                    soln_basis = {}
+        output_objs = {}
+        for out_name in self.output_map:
+            targets = self.output_map[out_name]["target"]
+            # output_names = self.output_map[out_name]["names"]
+            output_names = []
+            output_func = self.output_map[out_name]["function"]
 
-                    # Build a finite-element for each weak form
-                    elem_name = f"{output_name}_Element{etype}_{domain}"
-                    print(elem_name)
+            # Figure out the element types we need
+            etypes = []
+            for target in targets:
+                for etype in domains[target]:
+                    if not etype in etypes:
+                        etypes.append(etype)
 
-                    soln_basis = self.soln_dof.get_basis(etype)
-                    data_basis = self.data_dof.get_basis(etype)
-                    geo_basis = self.geo_dof.get_basis(etype)
+            # Loop over the element types for generating the output function
+            for etype in etypes:
+                elem_name = f"ElementOutput{out_name}{etype}"
 
-                    # Create the quadrature instance
-                    quadrature = self.soln_dof.get_quadrature(etype)
+                # Get the basis objects for the element type
+                soln_basis = self.soln_dof.get_basis(etype)
+                data_basis = self.data_dof.get_basis(etype)
+                geo_basis = self.geo_dof.get_basis(etype)
 
-                    print(self.output_map[output_name][domain])
-                    elem = FiniteElementOutput(
-                        elem_name,
-                        soln_basis,
-                        data_basis,
-                        geo_basis,
-                        quadrature,
-                        output_name,
-                        self.output_map,
-                        # self.output_map["name"],
-                        # self.output_map[output_domain_name],
-                    )
+                # Create the quadrature instance
+                quadrature = self.soln_dof.get_quadrature(etype)
+
+                # Create the output object
+                obj = FiniteElementOutput(
+                    elem_name,
+                    soln_basis,
+                    data_basis,
+                    geo_basis,
+                    quadrature,
+                    output_names,
+                    output_func,
+                )
+
+                # Set this into the output dictionary
+                output_objs[(out_name, etype)] = obj
+
+        for out_name in self.output_map:
+            targets = self.output_map[out_name]["target"]
+
+            for target in targets:
+                for etype in domains[target]:
+                    obj = output_objs[(out_name, etype)]
+                    comp_name = f"ElementOutput{out_name}{etype}{target}"
+
+                    # Add the element/component
+                    nelems = self.mesh.get_num_elements(target, etype)
+                    model.add_component(comp_name, nelems, elem)
+
+                    # Link all the element dof to the component
+                    self.soln_dof.link_dof(model, target, etype, comp_name)
+                    self.data_dof.link_dof(model, target, etype, comp_name)
+                    self.geo_dof.link_dof(model, target, etype, comp_name)
 
         # Link the output to the finite element class
         return model
@@ -644,9 +685,6 @@ class FiniteElementOutput(am.Component):
         data_basis,
         geo_basis,
         quadrature,
-        # output_names,
-        # output_function,
-        output_name,
         output_function,
     ):
         super().__init__(name=name)
@@ -655,8 +693,7 @@ class FiniteElementOutput(am.Component):
         self.data_basis = data_basis
         self.geo_basis = geo_basis
         self.quadrature = quadrature
-        # self.output_names = output_names
-        # self.output_function = output_function
+        self.output_function = output_function
 
         # From BasisCollection
         self.soln_basis.add_declarations(self)

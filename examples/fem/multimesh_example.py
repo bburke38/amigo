@@ -68,16 +68,12 @@ symm_bc_meshes = {
 # Weak form mapping for each mesh
 weakform_map = {
     "Mesh0": {
-        "name": "Mesh0_weak_forms",
-        "SURFACE1": weakform_air,
-        "SURFACE2": weakform_coils,
-        "SURFACE3": weakform_coils,
+        "air": {"target": ["SURFACE1"], "weakform": weakform_air},
+        "coil": {"target": ["SURFACE2", "SURFACE3"], "weakform": weakform_coils},
     },
     "Mesh1": {
-        "name": "Mesh1_weak_forms",
-        "SURFACE1": weakform_air,
-        "SURFACE2": weakform_coils,
-        "SURFACE3": weakform_coils,
+        "air": {"target": ["SURFACE1"], "weakform": weakform_air},
+        "coil": {"target": ["SURFACE2", "SURFACE3"], "weakform": weakform_coils},
     },
 }
 
@@ -94,12 +90,10 @@ for mesh_name, mesh in meshes.items():
     problem = Problem(
         mesh,
         soln_space,
-        weakform_map[mesh_name],
-        data_space=data_space,
-        geo_space=geo_space,
+        data_space,
+        geo_space,
+        weakform_map=weakform_map[mesh_name],
         dirichlet_bc_map=dirichlet_bc_meshes[mesh_name],
-        sym_bc_map=symm_bc_meshes[mesh_name],
-        ndim=2,
     )
     model = problem.create_model(mesh_name)
     main.add_model(mesh_name, model)
