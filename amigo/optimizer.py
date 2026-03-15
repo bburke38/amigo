@@ -280,9 +280,11 @@ class MumpsSolver(_HessianDiagMixin):
     def _build_struct(self):
         """Build the ctypes Structure matching DMUMPS_STRUC_C."""
         ct = self._ct
+        import sys
 
-        class DMUMPS_STRUC_C(ct.Structure):
-            _fields_ = [
+        if sys.platform == "win32":
+            # Layout matching the Windows MUMPS build (newer/custom version)
+            _mumps_fields = [
                 ("sym", ct.c_int),
                 ("par", ct.c_int),
                 ("job", ct.c_int),
@@ -373,6 +375,91 @@ class MumpsSolver(_HessianDiagMixin):
                 ("metis_options", ct.c_int * 40),
                 ("instance_number", ct.c_int),
             ]
+        else:
+            # Layout matching MUMPS 5.6.2 (Ubuntu libmumps-dev)
+            _mumps_fields = [
+                ("sym", ct.c_int),
+                ("par", ct.c_int),
+                ("job", ct.c_int),
+                ("comm_fortran", ct.c_int),
+                ("icntl", ct.c_int * 60),
+                ("keep", ct.c_int * 500),
+                ("cntl", ct.c_double * 15),
+                ("dkeep", ct.c_double * 230),
+                ("keep8", ct.c_int64 * 150),
+                ("n", ct.c_int),
+                ("nblk", ct.c_int),
+                ("nz_alloc", ct.c_int),
+                ("nz", ct.c_int),
+                ("nnz", ct.c_int64),
+                ("irn", ct.POINTER(ct.c_int)),
+                ("jcn", ct.POINTER(ct.c_int)),
+                ("a", ct.POINTER(ct.c_double)),
+                ("nz_loc", ct.c_int),
+                ("nnz_loc", ct.c_int64),
+                ("irn_loc", ct.POINTER(ct.c_int)),
+                ("jcn_loc", ct.POINTER(ct.c_int)),
+                ("a_loc", ct.POINTER(ct.c_double)),
+                ("nelt", ct.c_int),
+                ("eltptr", ct.POINTER(ct.c_int)),
+                ("eltvar", ct.POINTER(ct.c_int)),
+                ("a_elt", ct.POINTER(ct.c_double)),
+                ("blkptr", ct.POINTER(ct.c_int)),
+                ("blkvar", ct.POINTER(ct.c_int)),
+                ("perm_in", ct.POINTER(ct.c_int)),
+                ("sym_perm", ct.POINTER(ct.c_int)),
+                ("uns_perm", ct.POINTER(ct.c_int)),
+                ("colsca", ct.POINTER(ct.c_double)),
+                ("rowsca", ct.POINTER(ct.c_double)),
+                ("colsca_from_mumps", ct.c_int),
+                ("rowsca_from_mumps", ct.c_int),
+                ("rhs", ct.POINTER(ct.c_double)),
+                ("redrhs", ct.POINTER(ct.c_double)),
+                ("rhs_sparse", ct.POINTER(ct.c_double)),
+                ("sol_loc", ct.POINTER(ct.c_double)),
+                ("rhs_loc", ct.POINTER(ct.c_double)),
+                ("irhs_sparse", ct.POINTER(ct.c_int)),
+                ("irhs_ptr", ct.POINTER(ct.c_int)),
+                ("isol_loc", ct.POINTER(ct.c_int)),
+                ("irhs_loc", ct.POINTER(ct.c_int)),
+                ("nrhs", ct.c_int),
+                ("lrhs", ct.c_int),
+                ("lredrhs", ct.c_int),
+                ("nz_rhs", ct.c_int),
+                ("lsol_loc", ct.c_int),
+                ("nloc_rhs", ct.c_int),
+                ("lrhs_loc", ct.c_int),
+                ("schur_mloc", ct.c_int),
+                ("schur_nloc", ct.c_int),
+                ("schur_lld", ct.c_int),
+                ("mblock", ct.c_int),
+                ("nblock", ct.c_int),
+                ("nprow", ct.c_int),
+                ("npcol", ct.c_int),
+                ("info", ct.c_int * 80),
+                ("infog", ct.c_int * 80),
+                ("rinfo", ct.c_double * 40),
+                ("rinfog", ct.c_double * 40),
+                ("deficiency", ct.c_int),
+                ("pivnul_list", ct.POINTER(ct.c_int)),
+                ("mapping", ct.POINTER(ct.c_int)),
+                ("size_schur", ct.c_int),
+                ("listvar_schur", ct.POINTER(ct.c_int)),
+                ("schur", ct.POINTER(ct.c_double)),
+                ("instance_number", ct.c_int),
+                ("wk_user", ct.POINTER(ct.c_double)),
+                ("version_number", ct.c_char * 32),
+                ("ooc_tmpdir", ct.c_char * 256),
+                ("ooc_prefix", ct.c_char * 64),
+                ("write_problem", ct.c_char * 256),
+                ("lwk_user", ct.c_int),
+                ("save_dir", ct.c_char * 256),
+                ("save_prefix", ct.c_char * 256),
+                ("metis_options", ct.c_int * 40),
+            ]
+
+        class DMUMPS_STRUC_C(ct.Structure):
+            _fields_ = _mumps_fields
 
         self._DMUMPS_STRUC_C = DMUMPS_STRUC_C
         self._mumps = DMUMPS_STRUC_C()
