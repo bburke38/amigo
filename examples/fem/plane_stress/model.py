@@ -9,8 +9,6 @@ import argparse
 def weakform_plane_stress(soln, data=None, geo=None):
     """Strain energy density (integrand of TPE equation)"""
     # Displacement gradients in physical space
-    ux = soln["ux"]["value"]
-    uy = soln["uy"]["value"]
     ux_grad = soln["ux"]["grad"]
     uy_grad = soln["uy"]["grad"]
 
