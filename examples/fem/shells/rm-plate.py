@@ -129,43 +129,14 @@ print("Solving...")
 K = am.tocsr(mat)
 x.get_array()[:] = spsolve(K, g.get_array())
 
-# # print(np.max(u))
-# # Extract displacement fields
-# ux = u[model.get_indices("src_soln.ux")]
-# uy = u[model.get_indices("src_soln.uy")]
-
-# max_domain = np.max(np.maximum(ux, uy))
-# min_domain = np.min(np.minimum(ux, uy))
-
 print("Plotting...")
 
 w = xm["src_soln.w"]
 tx = xm["src_soln.tx"]
 ty = xm["src_soln.ty"]
 
-# fig, ax = plt.subplots(ncols=3)
-# mesh.plot(w, ax=ax[0])
-# mesh.plot(tx, ax=ax[1])
-# np.save('w_shearlocked.npy', w)
-# exit()
-# np.save("w_1e-4.npy", w)
-# w_shearlocked = np.load("w_shearlocked.npy")
-# mesh.plot_3d(w_shearlocked)
-# print(w)
-# print(w_shearlocked)
-
-
-# print(np.max(2*(w - w_shearlocked)/((np.abs(w)+np.abs(w_shearlocked)))))
-def max_relative_error(list1, list2, eps=1e-12):
-    return max(abs(a - b) / max(abs(a), abs(b), eps) for a, b in zip(list1, list2))
-
-
-a = 1.0
-w_normalized = 1000 * w * D / (q0 * a**4)
-print("normalized deflection max: ", np.max(np.abs(w_normalized)))
-mesh.plot_3d(w_normalized)
-
-# Also print number of nodes
-print(f"number of nodes: {mesh.X.shape[0]}")
-
+np.save("w_reducedshear.npy", w)
+w_shearlocked = np.load("w_shearlocked.npy")
+mesh.plot_3d(w)
+print(np.max(np.abs(((w - w_shearlocked)))))
 plt.show()
