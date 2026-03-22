@@ -2,8 +2,9 @@ import os
 import sys
 import time
 import numpy as np
+from collections import deque
 from scipy.sparse import csr_matrix
-from scipy.sparse.linalg import splu, eigsh
+from scipy.sparse.linalg import splu
 
 from .amigo import InteriorPointOptimizer, MemoryLocation
 from .model import ModelVector
@@ -103,6 +104,44 @@ def gmres(mult, precon, b, x, msub=20, rtol=1e-2, atol=1e-30):
     return
 
 
+def _find_diag_indices(rowp, cols, nrows):
+    """Find the CSR data-array index of each diagonal entry (row == col)."""
+    diag_idx = np.empty(nrows, dtype=np.intp)
+    for i in range(nrows):
+        start, end = rowp[i], rowp[i + 1]
+        row_cols = cols[start:end]
+        pos = np.searchsorted(row_cols, i)
+        if pos < len(row_cols) and row_cols[pos] == i:
+            diag_idx[i] = start + pos
+        else:
+            diag_idx[i] = start  # fallback (should not happen)
+    return diag_idx
+
+
+class _HessianDiagMixin:
+    """Shared Hessian-diagonal helpers for CSR-based solvers.
+
+    Requires subclass to have: self.problem, self.hess, self._diag_indices.
+    """
+
+    def assemble_hessian(self, alpha, x):
+        """Assemble Lagrangian Hessian and return its diagonal.
+
+        Leaves the assembled matrix in self.hess for a subsequent
+        add_diagonal_and_factor() call.  Cost: one Hessian evaluation +
+        one device-to-host copy.  No factorization.
+        """
+        self.problem.hessian(alpha, x, self.hess)
+        self.hess.copy_data_device_to_host()
+        return self.hess.get_data()[self._diag_indices].copy()
+
+    def get_hessian_diagonal(self, alpha, x):
+        """Evaluate Hessian and return its diagonal. O(n), no factorization."""
+        self.problem.hessian(alpha, x, self.hess)
+        self.hess.copy_data_device_to_host()
+        return self.hess.get_data()[self._diag_indices]
+
+
 class DirectCudaSolver:
     def __init__(self, problem, pivot_eps=1e-12):
         self.problem = problem
@@ -120,14 +159,12 @@ class DirectCudaSolver:
         self.problem.hessian(alpha, x, self.hess)
         self.problem.add_diagonal(diag, self.hess)
         self.solver.factor()
-        return
 
     def solve(self, bx, px):
         self.solver.solve(bx, px)
-        return
 
 
-class DirectScipySolver:
+class DirectScipySolver(_HessianDiagMixin):
     def __init__(self, problem):
         self.problem = problem
         loc = MemoryLocation.HOST_AND_DEVICE
@@ -135,40 +172,53 @@ class DirectScipySolver:
         self.nrows, self.ncols, self.nnz, self.rowp, self.cols = (
             self.hess.get_nonzero_structure()
         )
-
+        self._diag_indices = _find_diag_indices(self.rowp, self.cols, self.nrows)
         self.lu = None
-        return
 
-    def factor(self, alpha, x, diag):
-        """
-        Compute and factor the Hessian matrix
-        """
+    def add_diagonal_and_factor(self, diag):
+        """Add diagonal to the already-assembled Hessian and factorize.
 
-        # Compute the Hessian and add the diagonal values
-        self.problem.hessian(alpha, x, self.hess)
+        Must be called after assemble_hessian().  Modifies self.hess
+        in-place, so a subsequent retry must use factor() (which
+        re-assembles from scratch).
+        """
         self.problem.add_diagonal(diag, self.hess)
         self.hess.copy_data_device_to_host()
-
-        # Build the CSR matrix and convert to CSC
         shape = (self.nrows, self.ncols)
         data = self.hess.get_data()
         H = csr_matrix((data, self.cols, self.rowp), shape=shape).tocsc()
+        self.lu = splu(H, permc_spec="COLAMD", diag_pivot_thresh=1.0)
 
-        # Compute the LU factorization
+    def factor(self, alpha, x, diag):
+        """Assemble Hessian, add diagonal, and factorize (one shot).
+
+        Used for inertia-correction retries where we need a fresh
+        assembly (since add_diagonal_and_factor mutates self.hess).
+        """
+        self.problem.hessian(alpha, x, self.hess)
+        self.problem.add_diagonal(diag, self.hess)
+        self.hess.copy_data_device_to_host()
+        shape = (self.nrows, self.ncols)
+        data = self.hess.get_data()
+        H = csr_matrix((data, self.cols, self.rowp), shape=shape).tocsc()
         self.lu = splu(H, permc_spec="COLAMD", diag_pivot_thresh=1.0)
 
     def solve(self, bx, px):
-        """
-        Solve the KKT system
-        """
-
+        """Solve the KKT system."""
         bx.copy_device_to_host()
         px.get_array()[:] = self.lu.solve(bx.get_array())
         px.copy_host_to_device()
 
-        return
+    def solve_array(self, rhs):
+        """Solve K*x = rhs using existing factorization. Returns numpy array."""
+        return self.lu.solve(rhs)
 
-    def compute_eigenvalues(self, alpha, x, diag=None, k=20, sigma=0.0, which="LM"):
+    def get_inertia(self):
+        """Approximate inertia from LU diagonal (heuristic).
+
+        With diag_pivot_thresh=1.0 (strong diagonal pivoting), the signs of
+        U's diagonal approximate the eigenvalue signs of the original matrix.
+        Returns (n_positive, n_negative).
         """
         if self.lu is None:
             raise RuntimeError("Must call factor() before get_inertia()")
@@ -609,9 +659,8 @@ class PardisoSolver(_HessianDiagMixin):
         assembly (since add_diagonal_and_factor mutates self.hess).
         """
         self.problem.hessian(alpha, x, self.hess)
-        if diag is not None:
-            self.problem.add_diagonal(diag, self.hess)
-
+        self.problem.add_diagonal(diag, self.hess)
+        self.hess.copy_data_device_to_host()
         data = self.hess.get_data()
         if _debug_inertia:
             full_diag = data[self._diag_indices]
@@ -631,9 +680,23 @@ class PardisoSolver(_HessianDiagMixin):
         self._matrix.data[:] = data[self._upper_mask]
         self.pardiso.factorize(self._matrix)
 
-        eigs, vecs = eigsh(H, k=k, sigma=sigma, which=which)
+    def get_inertia(self):
+        """Return (n_positive, n_negative) eigenvalue counts from LDL^T.
 
-        return eigs, vecs
+        Uses PARDISO iparm(22) and iparm(23) (1-based Fortran indexing),
+        which are iparm[21] and iparm[22] in 0-based Python indexing.
+        """
+        return int(self.pardiso.iparm[21]), int(self.pardiso.iparm[22])
+
+    def solve(self, bx, px):
+        """Solve the KKT system."""
+        bx.copy_device_to_host()
+        px.get_array()[:] = self.pardiso.solve(self._matrix, bx.get_array())
+        px.copy_host_to_device()
+
+    def solve_array(self, rhs):
+        """Solve K*x = rhs using existing factorization. Returns numpy array."""
+        return self.pardiso.solve(self._matrix, rhs)
 
 
 class LNKSInexactSolver:
@@ -672,8 +735,6 @@ class LNKSInexactSolver:
         upper = model.num_variables
         self.design_indices = np.sort(np.setdiff1d(np.arange(upper), all_states))
 
-        return
-
     def factor(self, alpha, x, diag):
 
         # Compute the Hessian
@@ -691,12 +752,8 @@ class LNKSInexactSolver:
         self.A_lu = splu(self.A.tocsc(), permc_spec="COLAMD", diag_pivot_thresh=1.0)
         self.Hxx_lu = splu(self.Hxx.tocsc(), permc_spec="COLAMD", diag_pivot_thresh=1.0)
 
-        return
-
     def mult(self, x, y):
         y[:] = self.Hmat @ x
-
-        return
 
     def precon(self, b, x):
         x[self.res_indices] = self.A_lu.solve(b[self.state_indices], trans="T")
@@ -704,8 +761,6 @@ class LNKSInexactSolver:
         x[self.design_indices] = self.Hxx_lu.solve(bx)
         bu = b[self.res_indices] - self.dRdx @ x[self.design_indices]
         x[self.state_indices] = self.A_lu.solve(bu)
-
-        return
 
     def solve(self, bx, px):
         bx.copy_device_to_host()
@@ -718,8 +773,6 @@ class LNKSInexactSolver:
             rtol=self.gmres_rtol,
         )
         px.copy_host_to_device()
-
-        return
 
 
 class DirectPetscSolver:
@@ -741,8 +794,6 @@ class DirectPetscSolver:
         # Right-hand side and solution vector
         self.b = PETSc.Vec().createMPI(s, bsize=1, comm=comm)
         self.x = PETSc.Vec().createMPI(s, bsize=1, comm=comm)
-
-        return
 
     def factor(self, alpha, x, diag):
         # Compute the Hessian
@@ -777,9 +828,6 @@ class DirectPetscSolver:
         M.setMumpsIcntl(4, 1)  # Set verbosity of the output
         M.setMumpsCntl(1, 0.01)
 
-        # ksp.setMonitor(
-        #     lambda ksp, its, rnorm: print(f"Iter {its}: ||r|| = {rnorm:.3e}")
-        # )
         self.ksp.setUp()
 
     def solve(self, bx, px):
@@ -789,9 +837,6 @@ class DirectPetscSolver:
         self.ksp.solve(self.b, self.x)
         px.get_array()[: self.nrows_local] = self.x.getArray()[:]
 
-        # if self.comm.size == 1:
-        #     H = tocsr(self.hess)
-        #     px.get_array()[:] = spsolve(H, bx.get_array())
 
 class InertiaCorrector:
     """IPOPT Algorithm IC: inertia correction for the KKT system.
@@ -1242,6 +1287,12 @@ class Optimizer:
         else:
             self.upper = upper
 
+        # Ensure constraint bounds always come from model meta data.
+        # When users pass explicit lower/upper vectors (e.g. for primal
+        # bounds), constraint rows may have incorrect defaults (0/0),
+        # causing the C++ backend to misclassify inequalities as equalities.
+        self._merge_constraint_bounds(model)
+
         # Distribute the initial point
         if self.distribute:
             # Scatter the data vector
@@ -1312,7 +1363,24 @@ class Optimizer:
             self.diag = self.problem.create_vector()
             self.px = self.problem.create_vector()
 
-        return
+    def _merge_constraint_bounds(self, model):
+        """Overlay constraint bounds from model meta data onto self.lower/upper.
+
+        The C++ InteriorPointOptimizer classifies multiplier rows as
+        equality (lb == ub) or inequality (lb != ub) based on bounds.
+        When users supply explicit bound vectors, constraint rows may
+        default to 0/0, misclassifying inequalities as equalities.
+        """
+        lb_arr = self.lower.get_array()
+        ub_arr = self.upper.get_array()
+
+        for comp_name, comp in model.comp.items():
+            for con_name in comp.get_constraint_names():
+                full_name = comp_name + "." + con_name
+                meta = model.get_meta(full_name)
+                idx = model.get_indices(full_name)
+                lb_arr[idx] = meta["lower"]
+                ub_arr[idx] = meta["upper"]
 
     def write_log(self, iteration, iter_data):
         # Write out to the log information about this line
@@ -1329,21 +1397,21 @@ class Optimizer:
         for name in iter_data:
             if name != "iteration":
                 data = iter_data[name]
-                if isinstance(data, (int, np.integer)):
-                    line += f"{iter_data[name]:15d} "
+                if isinstance(data, (list, dict)):
+                    continue
+                elif isinstance(data, (int, np.integer)):
+                    line += f"{data:15d} "
                 else:
-                    line += f"{iter_data[name]:15.6e} "
+                    line += f"{data:15.6e} "
         print(line)
         sys.stdout.flush()
-
-        return
 
     def get_options(self, options={}):
         default = {
             "max_iterations": 100,
-            "barrier_strategy": "monotone",
+            "barrier_strategy": "heuristic",  # "heuristic", "monotone", "quality_function"
             "monotone_barrier_fraction": 0.1,
-            "convergence_tolerance": 1e-6,
+            "convergence_tolerance": 1e-8,
             "fraction_to_boundary": 0.95,
             "initial_barrier_param": 1.0,
             "max_line_search_iterations": 10,
@@ -1412,11 +1480,8 @@ class Optimizer:
 
         return default
 
-    def _compute_barrier_heuristic(self, xi, complementarity, gamma, r):
-        """
-        Compute the heuristic barrier parameter.
-        Formula: μ = γ * min((1-r)*(1-ξ)/ξ, 2)^3 * complementarity
-        """
+    def _compute_barrier_heuristic(self, xi, complementarity, gamma, r, tol=1e-12):
+        """Compute LOQO-style barrier parameter."""
         if xi > 1e-10:
             term = (1 - r) * (1 - xi) / xi
             heuristic_factor = min(term, 2.0) ** 3
@@ -1637,7 +1702,7 @@ class Optimizer:
 
         # Compute the residual based on the gradient. At this point the multipliers are zero
         x = self.vars.get_solution()
-        self.optimizer.compute_residual(0.0, 0.0, self.vars, self.grad, self.res)
+        self.optimizer.compute_residual(0.0, self.vars, self.grad, self.res)
 
         # Zero out the constraint contributions from the right-hand-side
         self.optimizer.set_multipliers_value(0.0, self.res)
@@ -1656,9 +1721,7 @@ class Optimizer:
         # Copy the multipiler values from self.px to x
         self.optimizer.copy_multipliers(x, self.px)
 
-        return
-
-    def _compute_affine_multipliers(self, gamma_penalty=1e3, beta_min=1.0):
+    def _compute_affine_multipliers(self, beta_min=1.0):
         """
         Compute the affine multipliers
         """
@@ -1699,14 +1762,43 @@ class Optimizer:
 
         return barrier
 
-    def _add_regularization_terms(self, diag, eps_x=1e-4, eps_z=1e-4):
-        self.optimizer.set_design_vars_value(eps_x, diag)
-        self.optimizer.set_multipliers_value(-eps_z, diag)
+    def _add_regularization_terms(
+        self,
+        diag,
+        eps_x=1e-4,
+        eps_z=1e-4,
+        zero_hessian_indices=None,
+        eps_x_zero=None,
+        nonconvex_indices=None,
+    ):
+        """
+        Add regularization to the KKT diagonal: +eps_x for primal, -eps_z for dual.
 
-        return
+        When nonconvex_indices is provided, eps_z is applied selectively:
+        tiny eps on all multipliers, full eps_z only on nonconvex constraints.
+        """
+        diag.copy_device_to_host()
+        d = diag.get_array()
+
+        problem = self.mpi_problem if self.distribute else self.problem
+        mult = np.array(problem.get_multiplier_indicator(), dtype=bool)
+
+        if nonconvex_indices is not None:
+            eps_z_num = 1e-10
+            d[~mult] += eps_x
+            d[mult] -= eps_z_num
+            if eps_z > eps_z_num:
+                d[nonconvex_indices] -= eps_z - eps_z_num
+        else:
+            d[~mult] += eps_x
+            d[mult] -= eps_z
+
+        if zero_hessian_indices is not None and eps_x_zero is not None:
+            d[zero_hessian_indices] += eps_x_zero - eps_x
+
+        diag.copy_host_to_device()
 
     def _zero_multipliers(self, x):
-        # Zero the multiplier contributions
         self.optimizer.set_multipliers_value(0.0, x)
 
     def _update_gradient(self, x):
@@ -2801,9 +2893,10 @@ class Optimizer:
 
         # 1. Unpack frequently-used options
         self.barrier_param = options["initial_barrier_param"]
-        self.gamma_penalty = options["gamma_peanlty"]
         max_iters = options["max_iterations"]
-        tau = options["fraction_to_boundary"]
+        base_tau = options["fraction_to_boundary"]
+        tau_min = options["tau_min"]
+        use_adaptive_tau = options["adaptive_tau"]
         tol = options["convergence_tolerance"]
         record_components = options["record_components"]
         continuation_control = options["continuation_control"]
@@ -2815,9 +2908,8 @@ class Optimizer:
         if not self.distribute:
             xview = ModelVector(self.model, x=x)
 
-        # Zero the multipliers so that the gradient consists of the objective gradient and
-        # constraint values
         self._zero_multipliers(x)
+        self._update_gradient(x)
 
         # Initialize slack variables and multipliers from the barrier parameter
         self.optimizer.initialize_multipliers_and_slacks(
@@ -2827,21 +2919,13 @@ class Optimizer:
         # Optionally compute better initial multiplier estimates
         if options["init_affine_step_multipliers"]:
             self._compute_least_squares_multipliers()
-
-            # Compute the affine step multipliers and the new barrier parameter
             self.barrier_param = self._compute_affine_multipliers(
-                beta_min=self.barrier_param, gamma_penalty=self.gamma_penalty
+                beta_min=self.barrier_param
             )
         elif options["init_least_squares_multipliers"]:
             self._compute_least_squares_multipliers()
 
-        # Compute the gradient
-        if self.distribute:
-            self.mpi_problem.update(x)
-            self.mpi_problem.gradient(1.0, x, self.grad)
-        else:
-            self.problem.update(x)
-            self.problem.gradient(1.0, x, self.grad)
+        self._update_gradient(x)
 
         # Step size tracking (for log output)
         line_iters = 0
@@ -2949,7 +3033,7 @@ class Optimizer:
         for i in range(max_iters):
             # Step A: Evaluate KKT residual at current iterate
             res_norm = self.optimizer.compute_residual(
-                self.barrier_param, self.gamma_penalty, self.vars, self.grad, self.res
+                self.barrier_param, self.vars, self.grad, self.res
             )
             res_norm_mu = self.barrier_param
 
@@ -2970,7 +3054,6 @@ class Optimizer:
             if continuation_control is not None:
                 continuation_control(i, res_norm)
 
-            # Set information about the residual norm into the
             iter_data = {
                 "iteration": i,
                 "time": elapsed_time,
@@ -3002,9 +3085,6 @@ class Optimizer:
                 complementarity, xi = self.optimizer.compute_complementarity(self.vars)
                 iter_data["xi"] = xi
                 iter_data["complementarity"] = complementarity
-                heuristic_data.append(
-                    {"iteration": i, "xi": xi, "complementarity": complementarity}
-                )
 
             if comm_rank == 0:
                 self.write_log(i, iter_data)
@@ -3036,25 +3116,25 @@ class Optimizer:
             if res_norm < tol:
                 opt_data["converged"] = True
                 break
-            elif res_norm <= 0.1 * self.barrier_param:
-                barrier_converged = True
 
-            # Check if the barrier problem has converged and update barrier parameter
-            if options["barrier_strategy"] == "heuristic":
-                # Heuristic barrier update - compute xi and complementarity if not already done
-                if "xi" in iter_data:
-                    xi = iter_data["xi"]
-                    complementarity = iter_data["complementarity"]
-                else:
-                    xi = self._compute_uniformity_measure()
-                    complementarity = self.optimizer.compute_complementarity(self.vars)
+            # Precision floor detection: bit-identical residuals mean we've
+            # hit numerical limits. Exit immediately instead of cycling.
+            rel_change = abs(res_norm - prev_res_norm) / max(res_norm, 1e-30)
+            if rel_change < 1e-14 and i > 0:
+                precision_floor_count += 1
+            else:
+                precision_floor_count = 0
 
-                self.barrier_param, _ = self._compute_barrier_heuristic(
-                    xi,
-                    complementarity,
-                    options["heuristic_barrier_gamma"],
-                    options["heuristic_barrier_r"],
-                )
+            if precision_floor_count >= 3 and res_norm < acceptable_tol:
+                if comm_rank == 0:
+                    print(
+                        f"  Precision floor: residual {res_norm:.6e} unchanged "
+                        f"for {precision_floor_count} iterations"
+                    )
+                opt_data["converged"] = True
+                opt_data["acceptable"] = True
+                opt_data["precision_floor"] = True
+                break
 
             # Check for stagnation and acceptable convergence
             # Track best residual (robust to barrier cycling that resets prev_res_norm)
@@ -3119,10 +3199,10 @@ class Optimizer:
 
             # Compute and cache the base diagonal (barrier Sigma)
             self.optimizer.compute_diagonal(self.vars, self.diag)
+            self.diag.copy_device_to_host()
+            diag_base = self.diag.get_array().copy()
 
-            # Solve the KKT system with the computed diagonal entries
-            self.solver.factor(1.0, x, self.diag)
-            self.solver.solve(self.res, self.px)
+            barrier_before = self.barrier_param
 
             # Filter LS path: IPOPT-style monotone A-3.
             # E_mu = max(||dual||, ||primal||, max_i|s_i*z_i - mu|)
@@ -3284,13 +3364,11 @@ class Optimizer:
 
             # Check the update (debug only)
             if options["check_update_step"]:
-                if self.distribute:
-                    hess = self.mpi_problem.create_matrix()
-                else:
-                    hess = self.problem.create_matrix()
+                hess = (
+                    self.mpi_problem if self.distribute else self.problem
+                ).create_matrix()
                 self.optimizer.check_update(
                     self.barrier_param,
-                    self.gamma_penalty,
                     self.grad,
                     self.vars,
                     self.update,
@@ -3438,8 +3516,21 @@ class Optimizer:
                 z_index_prev = -1
                 self.barrier_param = barrier_before
 
-                    # Apply a simple backtracking algorithm
-                    alpha *= options["backtracting_factor"]
+                if quality_func and qf_free_mode:
+                    comp, _ = self.optimizer.compute_complementarity(self.vars)
+                    qf_monotone_mu_cand = max(0.8 * comp, qf_mu_floor)
+                    M_k = max(qf_kkt_history)
+                    if qf_monotone_mu_cand > qf_mu_floor:
+                        qf_free_mode = False
+                        qf_M_k_at_entry = M_k
+                        qf_monotone_mu = qf_monotone_mu_cand
+                        if comm_rank == 0:
+                            print(
+                                f"  QF -> monotone (step rejected): "
+                                f"mu_bar={qf_monotone_mu:.4e}"
+                            )
+                    elif comm_rank == 0:
+                        print(f"  QF: comp at floor ({comp:.2e}), " f"skip monotone")
 
                 # Handle rejection escape: increase barrier after too many rejections
                 if consecutive_rejections >= max_rejections:

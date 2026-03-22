@@ -44,6 +44,7 @@ class ExprNode:
     def compute_cost(self):
         raise NotImplementedError
 
+
 class ConstNode(ExprNode):
     def __init__(self, name=None, value=None, type=float):
         super().__init__()

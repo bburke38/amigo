@@ -48,3 +48,5 @@ website/yarn-error.log
 website/npm-debug.log*
 logo/package-lock.json
 lib/
+examples/raceproject/
+examples/river_crossing/
