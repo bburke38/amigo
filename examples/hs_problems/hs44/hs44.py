@@ -1,15 +1,16 @@
 """
 HS44: Many active bounds (4 vars, 6 ineq)
   min  x1 - x2 - x3 - x1*x3 + x1*x4 + x2*x3 - x2*x4
-  s.t. -8 + x1 + 2*x2 >= 0       (c1)
-       -12 + 4*x1 + x2 >= 0      (c2)
-       -12 + 3*x1 + 4*x2 >= 0    (c3)
-       -8 + 2*x3 + x4 >= 0       (c4)
-       -8 + x3 + 2*x4 >= 0       (c5)
-       -5 + x3 + x4 >= 0         (c6)
+  s.t. -8 + x1 + 2*x2 >= 0
+       -12 + 4*x1 + x2 >= 0
+       -12 + 3*x1 + 4*x2 >= 0
+       -8 + 2*x3 + x4 >= 0
+       -8 + x3 + 2*x4 >= 0
+       -5 + x3 + x4 >= 0
        x1, x2, x3, x4 >= 0
   x0 = (0, 0, 0, 0), f* = -15
 """
+
 import amigo as am
 import argparse
 
@@ -34,9 +35,7 @@ class HS44(am.Component):
         x2 = self.inputs["x2"]
         x3 = self.inputs["x3"]
         x4 = self.inputs["x4"]
-        self.objective["obj"] = (
-            x1 - x2 - x3 - x1 * x3 + x1 * x4 + x2 * x3 - x2 * x4
-        )
+        self.objective["obj"] = x1 - x2 - x3 - x1 * x3 + x1 * x4 + x2 * x3 - x2 * x4
         self.constraints["c1"] = -8 + x1 + 2 * x2
         self.constraints["c2"] = -12 + 4 * x1 + x2
         self.constraints["c3"] = -12 + 3 * x1 + 4 * x2
@@ -56,6 +55,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = -15

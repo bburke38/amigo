@@ -8,6 +8,7 @@ HS100: Medium nonconvex (7 vars, 4 ineq)
        -4*x1^2 - x2^2 + 3*x1*x2 - 2*x3^2 - 5*x6 + 11*x7 >= 0
   x0 = (1,2,0,4,0,1,1), f* = 680.6300573
 """
+
 import amigo as am
 import argparse
 
@@ -37,22 +38,22 @@ class HS100(am.Component):
         x6 = self.inputs["x6"]
         x7 = self.inputs["x7"]
         self.objective["obj"] = (
-            (x1 - 10) ** 2 + 5 * (x2 - 12) ** 2 + x3**4
-            + 3 * (x4 - 11) ** 2 + 10 * x5**6 + 7 * x6**2
-            + x7**4 - 4 * x6 * x7 - 10 * x6 - 8 * x7
+            (x1 - 10) ** 2
+            + 5 * (x2 - 12) ** 2
+            + x3**4
+            + 3 * (x4 - 11) ** 2
+            + 10 * x5**6
+            + 7 * x6**2
+            + x7**4
+            - 4 * x6 * x7
+            - 10 * x6
+            - 8 * x7
         )
-        self.constraints["c1"] = (
-            127 - 2 * x1**2 - 3 * x2**4 - x3 - 4 * x4**2 - 5 * x5
-        )
-        self.constraints["c2"] = (
-            282 - 7 * x1 - 3 * x2 - 10 * x3**2 - x4 + x5
-        )
-        self.constraints["c3"] = (
-            196 - 23 * x1 - x2**2 - 6 * x6**2 + 8 * x7
-        )
+        self.constraints["c1"] = 127 - 2 * x1**2 - 3 * x2**4 - x3 - 4 * x4**2 - 5 * x5
+        self.constraints["c2"] = 282 - 7 * x1 - 3 * x2 - 10 * x3**2 - x4 + x5
+        self.constraints["c3"] = 196 - 23 * x1 - x2**2 - 6 * x6**2 + 8 * x7
         self.constraints["c4"] = (
-            -4 * x1**2 - x2**2 + 3 * x1 * x2
-            - 2 * x3**2 - 5 * x6 + 11 * x7
+            -4 * x1**2 - x2**2 + 3 * x1 * x2 - 2 * x3**2 - 5 * x6 + 11 * x7
         )
 
 
@@ -67,6 +68,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 200, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 200,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = 680.6300573

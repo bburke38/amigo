@@ -4,6 +4,7 @@ HS60: Nonlinear equality (3 vars, 1 eq)
   s.t. x1*(1 + x2^2) + x3^4 - 4 - 3*sqrt(2) = 0
   x0 = (2, 2, 2), f* = 0.0325682
 """
+
 import amigo as am
 import argparse
 import numpy as np
@@ -37,6 +38,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = 0.0325682

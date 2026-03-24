@@ -7,6 +7,7 @@ HS53: Over-determined equalities (5 vars, 3 eq)
        -10 <= xi <= 10
   x0 = (2, 2, 2, 2, 2), f* = 176/43 ≈ 4.0930233
 """
+
 import amigo as am
 import argparse
 
@@ -31,8 +32,7 @@ class HS53(am.Component):
         x4 = self.inputs["x4"]
         x5 = self.inputs["x5"]
         self.objective["obj"] = (
-            (x1 - x2) ** 2 + (x2 + x3 - 2) ** 2
-            + (x4 - 1) ** 2 + (x5 - 1) ** 2
+            (x1 - x2) ** 2 + (x2 + x3 - 2) ** 2 + (x4 - 1) ** 2 + (x5 - 1) ** 2
         )
         self.constraints["c1"] = x1 + 3 * x2
         self.constraints["c2"] = x3 + x4 - 2 * x5
@@ -50,6 +50,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = 4.0930233

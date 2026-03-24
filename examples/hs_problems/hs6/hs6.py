@@ -4,6 +4,7 @@ HS6: Equality constraint on Rosenbrock valley (2 vars, 1 eq)
   s.t. 10*(x2 - x1^2) = 0
   x0 = (-1.2, 1), f* = 0
 """
+
 import amigo as am
 import argparse
 
@@ -34,6 +35,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = 0

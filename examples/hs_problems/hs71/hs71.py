@@ -1,13 +1,10 @@
 """
-HS71: IPOPT canonical test problem (4 vars, 2 constraints)
-
+HS71: Canonical NLP test (4 vars, 2 constraints)
   min  x1*x4*(x1+x2+x3) + x3
   s.t. x1*x2*x3*x4 >= 25
        x1^2 + x2^2 + x3^2 + x4^2 = 40
-       1 <= x1,x2,x3,x4 <= 5
-
-  x0 = (1, 5, 5, 1)
-  f* = 17.0140173
+       1 <= xi <= 5
+  x0 = (1, 5, 5, 1), f* = 17.0140173
 """
 
 import amigo as am
@@ -51,10 +48,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({
-    "initial_barrier_param": 0.1,
-    "max_iterations": 100,
-    "max_line_search_iterations": 30,
-    "convergence_tolerance": 1e-8,
-    "filter_line_search": True,
-})
+opt.optimize(
+    {
+        "initial_barrier_param": 0.1,
+        "max_iterations": 100,
+        "max_line_search_iterations": 30,
+        "convergence_tolerance": 1e-8,
+        "filter_line_search": True,
+    }
+)

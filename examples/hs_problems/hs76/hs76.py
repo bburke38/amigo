@@ -3,11 +3,12 @@ HS76: Standard QP test (4 vars, 3 ineq)
   min  x1^2 + 0.5*x2^2 + x3^2 + 0.5*x4^2 - x1*x3 - x3*x4
        - x1 - 3*x2 + x3 - x4
   s.t. 5 - x1 - x2 - x3 - x4 >= 0
-       8 + x1 + x2 - x3 - x4 >= 0 (corrected)
-       6 - x1 + x2 - x3 + x4 >= 0 (corrected)
+       8 + x1 + x2 - x3 - x4 >= 0
+       6 - x1 + x2 - x3 + x4 >= 0
        x1, x2, x3, x4 >= 0
   x0 = (0.5, 0.5, 0.5, 0.5), f* = -4.681818
 """
+
 import amigo as am
 import argparse
 
@@ -30,9 +31,16 @@ class HS76(am.Component):
         x3 = self.inputs["x3"]
         x4 = self.inputs["x4"]
         self.objective["obj"] = (
-            x1**2 + 0.5 * x2**2 + x3**2 + 0.5 * x4**2
-            - x1 * x3 - x3 * x4
-            - x1 - 3 * x2 + x3 - x4
+            x1**2
+            + 0.5 * x2**2
+            + x3**2
+            + 0.5 * x4**2
+            - x1 * x3
+            - x3 * x4
+            - x1
+            - 3 * x2
+            + x3
+            - x4
         )
         self.constraints["c1"] = 5 - x1 - x2 - x3 - x4
         self.constraints["c2"] = 8 + x1 + x2 - x3 - x4
@@ -50,6 +58,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = -4.681818

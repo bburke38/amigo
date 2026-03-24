@@ -6,6 +6,7 @@ HS40: Cubic constraints (4 vars, 3 eq)
        x4^2 - x2 = 0
   x0 = (0.8, 0.8, 0.8, 0.8), f* = -0.25
 """
+
 import amigo as am
 import argparse
 
@@ -44,6 +45,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = -0.25

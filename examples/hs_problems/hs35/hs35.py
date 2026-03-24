@@ -6,6 +6,7 @@ HS35: Active inequality at solution (3 vars, 1 ineq)
        x1, x2, x3 >= 0
   x0 = (0.5, 0.5, 0.5), f* = 1/9
 """
+
 import amigo as am
 import argparse
 
@@ -24,9 +25,15 @@ class HS35(am.Component):
         x2 = self.inputs["x2"]
         x3 = self.inputs["x3"]
         self.objective["obj"] = (
-            9 - 8 * x1 - 6 * x2 - 4 * x3
-            + 2 * x1**2 + 2 * x2**2 + x3**2
-            + 2 * x1 * x2 + 2 * x1 * x3
+            9
+            - 8 * x1
+            - 6 * x2
+            - 4 * x3
+            + 2 * x1**2
+            + 2 * x2**2
+            + x3**2
+            + 2 * x1 * x2
+            + 2 * x1 * x3
         )
         self.constraints["c1"] = x1 + x2 + 2 * x3
 
@@ -42,6 +49,12 @@ if args.build:
 model.initialize()
 
 opt = am.Optimizer(model)
-opt.optimize({"max_iterations": 100, "filter_line_search": True,
-              "convergence_tolerance": 1e-8, "max_line_search_iterations": 30})
+opt.optimize(
+    {
+        "max_iterations": 100,
+        "filter_line_search": True,
+        "convergence_tolerance": 1e-8,
+        "max_line_search_iterations": 30,
+    }
+)
 # f* = 0.1111111
