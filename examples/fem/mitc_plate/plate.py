@@ -153,18 +153,21 @@ print("Evaluating the Hessian...")
 model.eval_gradient(x, g)
 model.eval_hessian(x, mat)
 
-# Solve the equations
-print("Solving...")
-K = am.tocsr(mat)
-x[:] = spsolve(K, g[:])
-
-print("Plotting...")
-w = x["soln.w"]
-tx = x["soln.tx"]
-ty = x["soln.ty"]
-
-fig, ax = plt.subplots(1, 3, figsize=(8, 3))
-for index, soln in enumerate([w, tx, ty]):
-    mesh.plot(soln, ax=ax[index])
-
+plt.spy(am.tocsr(mat), markersize=1)
 plt.show()
+
+# # Solve the equations
+# print("Solving...")
+# chol = am.SparseCholesky(mat)
+# flag = chol.factor()
+
+# print("Plotting...")
+# w = x["soln.w"]
+# tx = x["soln.tx"]
+# ty = x["soln.ty"]
+
+# fig, ax = plt.subplots(1, 3, figsize=(8, 3))
+# for index, soln in enumerate([w, tx, ty]):
+#     mesh.plot(soln, ax=ax[index])
+
+# plt.show()

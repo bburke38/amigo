@@ -722,9 +722,8 @@ class Model:
 
         if order_for_block:
             constraint_indices = self._get_constraint_indices()
-            iperm = reorder_model(
-                order_type, arrays, constraint_indices=constraint_indices
-            )
+            print(constraint_indices)
+            iperm = reorder_model(order_type, arrays, constraint_indices)
         else:
             iperm = reorder_model(order_type, arrays)
 
