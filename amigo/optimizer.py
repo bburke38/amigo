@@ -346,7 +346,10 @@ class MumpsSolver(_HessianDiagMixin):
         self._mumps.icntl[9] = 0  # ICNTL(10): no iterative refinement
         self._mumps.icntl[12] = 1  # ICNTL(13): proper inertia detection
         self._mumps.icntl[13] = 1000  # ICNTL(14): workspace increase %
-        self._mumps.icntl[23] = 1  # ICNTL(24): null pivot detection
+        # ICNTL(24) = 0: do NOT enable null pivot detection during normal
+        # factorization (matches IPOPT).  When enabled, near-zero negative
+        # pivots can be misclassified as "null", corrupting the inertia count.
+        self._mumps.icntl[23] = 0  # ICNTL(24): null pivot detection OFF
         self._mumps.cntl[0] = 1e-6  # CNTL(1):  pivot tolerance
 
         # Set matrix structure and values pointer
@@ -591,14 +594,14 @@ class MumpsSolver(_HessianDiagMixin):
         self._factorize_current()
 
     def get_inertia(self):
-        """Return (n_positive, n_negative) from MUMPS infog(12) and infog(28).
+        """Return (n_positive, n_negative) from MUMPS infog(12).
 
         infog(12) = number of negative pivots in LDL^T factorization.
-        infog(28) = number of null pivots (when icntl(24)=1).
+        With ICNTL(24)=0 (null pivot detection off, matching IPOPT),
+        all pivots are classified as positive or negative.
         """
         n_neg = int(self._mumps.infog[11])
-        n_null = int(self._mumps.infog[27])  # infog(28), 0-indexed as [27]
-        n_pos = self.nrows - n_neg - n_null
+        n_pos = self.nrows - n_neg
         return n_pos, n_neg
 
     def solve(self, bx, px):
@@ -908,15 +911,7 @@ class InertiaCorrector:
     _TEST_DC0_DX1 = 3
     _TEST_DC1_DX1 = 4
 
-    def __init__(
-        self,
-        mult_ind,
-        barrier_param,
-        options,
-        model=None,
-        solver=None,
-        distribute=False,
-    ):
+    def __init__(self, mult_ind, barrier_param, options):
         self.mult_ind = mult_ind
         self._barrier = barrier_param
         self.numerical_eps = 1e-12
@@ -952,27 +947,9 @@ class InertiaCorrector:
         self._pivtol = 1e-6
         self._pivtolmax = 0.1
 
-        # Amigo extensions: selective eps_z for nonconvex constraints
-        self.cz = options.get("convex_eps_z_coeff", 10.0)
-        self.eps_z = 0.0
-        self._nonconvex_indices = None
-
-        nc_constraints = options.get("nonconvex_constraints", [])
-        if nc_constraints and model is not None and not distribute:
-            self._nonconvex_indices = np.sort(model.get_indices(nc_constraints))
-            self.eps_z = self.cz * barrier_param
-            print(
-                f"  Selective eps_z: {len(self._nonconvex_indices)} "
-                f"nonconvex constraint entries"
-            )
-
     def update_barrier(self, mu):
-        """Synchronize internal barrier parameter and recompute eps_z."""
+        """Synchronize internal barrier parameter."""
         self._barrier = mu
-        if self._nonconvex_indices is not None:
-            self.eps_z = self.cz * mu
-        else:
-            self.eps_z = 0.0
 
     def _delta_cd(self):
         """Constraint regularization: delta_c = delta_cd_val * mu^delta_cd_exp."""
@@ -980,6 +957,7 @@ class InertiaCorrector:
 
     def _get_deltas_for_wrong_inertia(self):
         """Grow delta_x geometrically. Returns False if delta_x exceeds max."""
+        prev = self._delta_x_curr
         if self._delta_x_curr == 0.0:
             if self._delta_x_last == 0.0:
                 self._delta_x_curr = self._dw_init
@@ -997,6 +975,8 @@ class InertiaCorrector:
                 self._delta_x_curr *= self._kw_inc
 
         if self._delta_x_curr > self._dw_max:
+            # Revert: the overflowed value was never used in a factorization
+            self._delta_x_curr = prev
             self._delta_x_last = 0.0
             return False
         return True
@@ -1122,6 +1102,11 @@ class InertiaCorrector:
         """
         self._finalize_test()
 
+        # Note: pivot tolerance is NOT reset here — it persists across
+        # iterations, matching IPOPT's ConsiderNewSystem behavior.  Once
+        # IncreaseQuality raises pivtol, the solver keeps the more
+        # accurate setting for subsequent systems.
+
         # Save last perturbation
         if self._delta_x_curr > 0.0:
             self._delta_x_last = self._delta_x_curr
@@ -1150,7 +1135,6 @@ class InertiaCorrector:
     def factorize(
         self,
         solver,
-        optimizer_self,
         x,
         diag,
         diag_base,
@@ -1176,16 +1160,9 @@ class InertiaCorrector:
                 and np_ + nn_ >= n_total - itol
             )
 
-        # Build baseline diagonal: Sigma + small numerical eps
+        # Build baseline diagonal: Sigma + small numerical eps on primals
         diag_arr = diag.get_array()
         diag_arr[primal_mask] += self.numerical_eps
-        if self._nonconvex_indices is not None and self.eps_z > 0:
-            ineq_dual_mask = self.mult_ind & (diag_arr < -1e-30)
-            nc_ineq_idx = self._nonconvex_indices[
-                np.isin(self._nonconvex_indices, np.where(ineq_dual_mask)[0])
-            ]
-            if len(nc_ineq_idx) > 0:
-                diag_arr[nc_ineq_idx] -= self.eps_z
         if zero_hessian_indices is not None and zero_hessian_eps is not None:
             np.maximum(
                 diag_arr[zero_hessian_indices],
@@ -1246,7 +1223,7 @@ class InertiaCorrector:
                         f"delta_c={self._delta_c_curr:.2e}, "
                         f"attempts={attempt + 1}"
                     )
-                return
+                return True
 
             if comm_rank == 0 and not singular:
                 print(
@@ -1280,8 +1257,10 @@ class InertiaCorrector:
                         )
                     break
 
+        # Inertia correction failed — store last actually-applied values
         self.last_delta_w = self._delta_x_curr
         self.last_delta_c = self._delta_c_curr
+        return False
 
     def _increase_quality(self, solver):
         """Increase pivot tolerance: pivtol = min(pivtolmax, sqrt(pivtol))."""
@@ -1453,6 +1432,15 @@ class Optimizer:
             )
             data_vec = self.problem.get_data_vector()
 
+        # Register slack-to-constraint mapping (if model has inequalities)
+        if self.model.num_slacks > 0 and not self.distribute:
+            self.optimizer.set_slack_mapping(
+                np.ascontiguousarray(self.model.slack_indices, dtype=np.int32),
+                np.ascontiguousarray(
+                    self.model.ineq_constraint_indices, dtype=np.int32
+                ),
+            )
+
         # Copy the essential information from host to device
         x_vec.copy_host_to_device()
         data_vec.copy_host_to_device()
@@ -1570,8 +1558,6 @@ class Optimizer:
             "zero_hessian_variables": [],  # Variable names (e.g., ["dyn.qdot"])
             "regularization_eps_x_zero_hessian": 1.0,  # Strong eps_x for those variables
             # Algorithm IC inertia correction (auto-detected from solver)
-            "convex_eps_z_coeff": 1.0,  # C_z: eps_z = C_z * mu
-            "nonconvex_constraints": [],  # Constraint names for selective eps_z
             "max_consecutive_rejections": 5,  # Before barrier increase
             "barrier_increase_factor": 5.0,  # Barrier *= this when stuck
             "max_inertia_corrections": 40,
@@ -1882,29 +1868,16 @@ class Optimizer:
         eps_z=1e-4,
         zero_hessian_indices=None,
         eps_x_zero=None,
-        nonconvex_indices=None,
     ):
-        """
-        Add regularization to the KKT diagonal: +eps_x for primal, -eps_z for dual.
-
-        When nonconvex_indices is provided, eps_z is applied selectively:
-        tiny eps on all multipliers, full eps_z only on nonconvex constraints.
-        """
+        """Add regularization to the KKT diagonal: +eps_x for primal, -eps_z for dual."""
         diag.copy_device_to_host()
         d = diag.get_array()
 
         problem = self.mpi_problem if self.distribute else self.problem
         mult = np.array(problem.get_multiplier_indicator(), dtype=bool)
 
-        if nonconvex_indices is not None:
-            eps_z_num = 1e-10
-            d[~mult] += eps_x
-            d[mult] -= eps_z_num
-            if eps_z > eps_z_num:
-                d[nonconvex_indices] -= eps_z - eps_z_num
-        else:
-            d[~mult] += eps_x
-            d[mult] -= eps_z
+        d[~mult] += eps_x
+        d[mult] -= eps_z
 
         if zero_hessian_indices is not None and eps_x_zero is not None:
             d[zero_hessian_indices] += eps_x_zero - eps_x
@@ -1941,16 +1914,15 @@ class Optimizer:
         exponential growth of delta_w).  Otherwise, factors directly with
         a simple fallback regularization on failure.
 
-        After this call, the solver is ready for back-solves via
-        solver.solve().
+        Returns True if factorization succeeded (correct inertia or no
+        inertia check), False if inertia correction exhausted its budget.
         """
         self.diag.get_array()[:] = diag_base
         self.diag.copy_host_to_device()
 
         if inertia_corrector is not None and hasattr(self.solver, "assemble_hessian"):
-            inertia_corrector.factorize(
+            return inertia_corrector.factorize(
                 self.solver,
-                self,
                 x,
                 self.diag,
                 diag_base,
@@ -1972,135 +1944,193 @@ class Optimizer:
                     diag_arr += 1e-4
                 self.diag.copy_host_to_device()
                 self.solver.factor(1.0, x, self.diag)
+            return True
 
     def _iterative_refinement(self, mu, mult_ind, condensed_rhs, max_steps=10):
-        """Iterative refinement on the full unreduced system (Section 3.10).
+        """Iterative refinement for the full-space KKT solve.
 
-        Residuals are computed on the full 3-block Newton system, condensed
-        back to the 2x2 system for the correction solve, then bound duals
-        are updated via back-substitution.
+        Residuals are computed on the full 8-block unreduced Newton system
+        (x, s, y_c, y_d, z_L, z_U, v_L, v_U) and the residual ratio uses
+        the uncondensed max-norm across all blocks.  Corrections are obtained
+        by condensing the residual into the augmented system, solving with
+        the existing factorization, and back-substituting for bound duals.
         """
         px = self.px.get_array()
         n = len(px)
 
-        # Current state
+        # Current-point data (frozen for the entire IR)
         x = np.array(self.vars.get_solution().get_array())
         g = np.array(self.grad.get_array())
         zl = np.array(self.vars.get_zl())
         zu = np.array(self.vars.get_zu())
-        lbx = np.array(self.optimizer.get_lbx())
-        ubx = np.array(self.optimizer.get_ubx())
+        # Use relaxed bounds, consistent with KKT matrix assembly.
+        # get_lbx()/get_ubx() return the original bounds, so replicate
+        # the same relaxation that the backend applied at startup.
+        if hasattr(self.optimizer, "get_lbx_relaxed"):
+            lbx = np.array(self.optimizer.get_lbx_relaxed())
+            ubx = np.array(self.optimizer.get_ubx_relaxed())
+        else:
+            lbx_orig = np.array(self.optimizer.get_lbx())
+            ubx_orig = np.array(self.optimizer.get_ubx())
+            brf = 1e-8  # bound_relax_factor
+            cvt = 1e-4  # constr_viol_tol
+            lbx = lbx_orig.copy()
+            ubx = ubx_orig.copy()
+            fl_orig = np.isfinite(lbx_orig)
+            fu_orig = np.isfinite(ubx_orig)
+            if np.any(fl_orig):
+                delta_l = np.minimum(
+                    cvt, brf * np.maximum(1.0, np.abs(lbx_orig[fl_orig]))
+                )
+                lbx[fl_orig] = lbx_orig[fl_orig] - delta_l
+            if np.any(fu_orig):
+                delta_u = np.minimum(
+                    cvt, brf * np.maximum(1.0, np.abs(ubx_orig[fu_orig]))
+                )
+                ubx[fu_orig] = ubx_orig[fu_orig] + delta_u
 
         # Index sets
-        pi = np.where(~mult_ind)[0]
-        ci = np.where(mult_ind)[0]
-        np_ = len(pi)
+        pi = np.where(~mult_ind)[0]  # primal indices (design + slacks)
+        ci = np.where(mult_ind)[0]  # constraint indices (eq + ineq)
 
-        # Gaps (primal-sized arrays)
+        # Gaps and finite-bound masks (primal-sized)
         gap_l = x[pi] - lbx
         gap_u = ubx - x[pi]
         fl = np.isfinite(lbx)
         fu = np.isfinite(ubx)
-
-        # Safe gaps for division (avoid /0 for unbounded variables)
-        gl = np.where(fl, gap_l, 1.0)
+        gl = np.where(fl, gap_l, 1.0)  # safe for division
         gu = np.where(fu, gap_u, 1.0)
 
-        # Initial dz from back-substitution (eq 12)
+        # Sigma = zl/gap_l + zu/gap_u (barrier diagonal, primal-sized)
+        sigma = np.where(fl, zl / gl, 0.0) + np.where(fu, zu / gu, 0.0)
+
+        # Initial bound dual steps from back-substitution
         dx = px[pi]
         dzl = np.where(fl, (mu - gl * zl - zl * dx) / gl, 0.0)
         dzu = np.where(fu, (mu - gu * zu + zu * dx) / gu, 0.0)
 
-        # K_reg matrix for matvec
+        # Augmented matrix K for matvec (sparse, includes Sigma on diagonal)
         self.solver.hess.copy_data_device_to_host()
         hdata = np.array(self.solver.hess.get_data())
         K = csr_matrix((hdata, self.solver.cols, self.solver.rowp), shape=(n, n))
 
-        # Full-system RHS (constant across refinement steps)
-        # Row 1: b1 = -(grad[pi] - zl + zu)
-        # Row 2: b2 = condensed_rhs[ci]  (= -(grad[ci] - lbh))
-        # Row 3: b3l = mu - gap_l * zl,  b3u = mu - gap_u * zu
-        b1 = -(g[pi] - zl + zu)
-        b2 = condensed_rhs[ci]
-        b3l = np.where(fl, mu - gl * zl, 0.0)
-        b3u = np.where(fu, mu - gu * zu, 0.0)
+        # Full 8-block RHS (constant across IR steps)
+        # Block 1 (x stationarity): rhs_x = -(grad[pi] - zl + zu)
+        # Block 2 (constraint feas): rhs_c = -(grad[ci] - lbh) = condensed_rhs[ci]
+        # Block 3 (compl lower):     rhs_zl = mu - gap_l * zl
+        # Block 4 (compl upper):     rhs_zu = mu - gap_u * zu
+        rhs_x = -(g[pi] - zl + zu)
+        rhs_c = condensed_rhs[ci]
+        rhs_zl = np.where(fl, mu - gl * zl, 0.0)
+        rhs_zu = np.where(fu, mu - gu * zu, 0.0)
+
+        # RHS norm for ratio (max over all 8 blocks)
+        nrm_rhs = max(
+            np.max(np.abs(rhs_x)) if len(rhs_x) > 0 else 0.0,
+            np.max(np.abs(rhs_c)) if len(rhs_c) > 0 else 0.0,
+            np.max(np.abs(rhs_zl)) if len(rhs_zl) > 0 else 0.0,
+            np.max(np.abs(rhs_zu)) if len(rhs_zu) > 0 else 0.0,
+        )
 
         # Refinement parameters
         residual_ratio_max = 1e-10
         residual_improvement_factor = 0.999999999
-        nrm_rhs = np.max(np.abs(condensed_rhs)) + 1e-30
+        min_refinement_steps = 1
         max_cond = 1e6
         residual_ratio_old = 1e30
 
+        n_ir_steps = 0
         for step in range(max_steps):
+            # Compute full 8-block residual
             Kpx = K.dot(px)
 
-            # Full-system residual
-            # Row 1: e1_full = b1 - ((W+dw)*dx + A^T*dlam) + dzl - dzu
-            #   Since K = W+Sigma+dw: Kpx[pi] = (W+Sigma+dw)*dx + A^T*dlam
-            #   So: e1 = b1 - Kpx[pi] + Sigma*dx + dzl - dzu
-            sigma_dx = np.where(fl, zl / gl, 0.0) * dx + np.where(fu, zu / gu, 0.0) * dx
-            e1 = b1 - Kpx[pi] + sigma_dx + dzl - dzu
+            # Block 1 (x): e_x = rhs_x - (K*px)[pi] + Sigma*dx + dzl - dzu
+            #   K contains W+Sigma+delta_x, so subtract Sigma*dx to get W+delta_x part
+            e_x = rhs_x - Kpx[pi] + sigma * dx + dzl - dzu
 
-            # Row 2: e2 = b2 - Kpx[ci]
-            e2 = b2 - Kpx[ci]
+            # Block 2 (constraints): e_c = rhs_c - (K*px)[ci]
+            e_c = rhs_c - Kpx[ci]
 
-            # Row 3: e3l = b3l - zl*dx - gap_l*dzl
-            #         e3u = b3u + zu*dx - gap_u*dzu
-            e3l = np.where(fl, b3l - zl * dx - gl * dzl, 0.0)
-            e3u = np.where(fu, b3u + zu * dx - gu * dzu, 0.0)
+            # Block 3 (compl lower): e_zl = rhs_zl - zl*dx - gap_l*dzl
+            e_zl = np.where(fl, rhs_zl - zl * dx - gl * dzl, 0.0)
 
-            # Condense Row 3 into Row 1 (same algebra as eq 11)
-            e_cond = np.zeros(n)
-            e_cond[pi] = e1 + np.where(fl, e3l / gl, 0.0) - np.where(fu, e3u / gu, 0.0)
-            e_cond[ci] = e2
+            # Block 4 (compl upper): e_zu = rhs_zu + zu*dx - gap_u*dzu
+            e_zu = np.where(fu, rhs_zu + zu * dx - gu * dzu, 0.0)
 
-            # Residual ratio (backward error norm)
-            nrm_resid = np.max(np.abs(e_cond)) + 1e-30
-            nrm_res = np.max(np.abs(px)) + 1e-30
+            # Residual ratio
+            # Max-norm over ALL blocks (uncondensed)
+            nrm_resid = max(
+                np.max(np.abs(e_x)) if len(e_x) > 0 else 0.0,
+                np.max(np.abs(e_c)) if len(e_c) > 0 else 0.0,
+                np.max(np.abs(e_zl)) if len(e_zl) > 0 else 0.0,
+                np.max(np.abs(e_zu)) if len(e_zu) > 0 else 0.0,
+            )
+
+            # Solution norm over ALL components (px + dzl + dzu)
+            nrm_res = max(
+                np.max(np.abs(px)) if len(px) > 0 else 0.0,
+                np.max(np.abs(dzl)) if len(dzl) > 0 else 0.0,
+                np.max(np.abs(dzu)) if len(dzu) > 0 else 0.0,
+            )
+
             residual_ratio = nrm_resid / (min(nrm_res, max_cond * nrm_rhs) + nrm_rhs)
 
-            if residual_ratio < residual_ratio_max:
+            if residual_ratio < residual_ratio_max and step >= min_refinement_steps:
                 break
 
-            # Stall detection
+            # Stall detection (improvement factor check)
             if (
-                step > 0
+                step >= min_refinement_steps
                 and residual_ratio > residual_improvement_factor * residual_ratio_old
             ):
                 break
             residual_ratio_old = residual_ratio
 
-            # Solve condensed correction with existing factorization
+            # Condense residual for correction solve
+            # Fold complementarity residual into primal rows:
+            #   e_cond[pi] = e_x + e_zl/gap_l - e_zu/gap_u
+            #   e_cond[ci] = e_c
+            e_cond = np.zeros(n)
+            e_cond[pi] = (
+                e_x + np.where(fl, e_zl / gl, 0.0) - np.where(fu, e_zu / gu, 0.0)
+            )
+            e_cond[ci] = e_c
+
+            # Solve correction with existing factorization
             corr = self.solver.solve_array(e_cond)
 
-            # Back-substitute for dz corrections
+            # Back-substitute for bound dual corrections
             dc = corr[pi]
-            dzl += np.where(fl, (e3l - zl * dc) / gl, 0.0)
-            dzu += np.where(fu, (e3u + zu * dc) / gu, 0.0)
+            dzl += np.where(fl, (e_zl - zl * dc) / gl, 0.0)
+            dzu += np.where(fu, (e_zu + zu * dc) / gu, 0.0)
 
-            # Update primal-dual direction
+            # Accumulate into solution
             px[:] += corr
             dx = px[pi]
+            n_ir_steps += 1
+
+        pass
 
     def _solve_with_mu(self, mu, inertia_corrector=None, mult_ind=None):
-        """Compute the Newton direction by back-solving the factorized KKT system.
+        """Solve the augmented KKT system for the Newton direction.
 
-        Given the factorized KKT matrix K from _factorize_kkt(), this computes:
-          1. RHS residual r(mu) from the KKT conditions at barrier param mu
-          2. Reduced-space step px = K^{-1} r
-          3. Optional iterative refinement when delta_w > 0
-          4. Full primal-dual update from px
+        Full-space solve flow:
+          1. Build condensed RHS (8-block to 4-block)
+          2. Solve augmented system: K * px = res
+          3. Iterative refinement on the full unreduced 8-block system
+          4. Back-substitute for bound dual steps
 
         Requires _factorize_kkt() to have been called first.
         """
+        # Step 1: Condensed RHS (8-block to 4-block)
         self.optimizer.compute_residual(mu, self.vars, self.grad, self.res)
         self.res.copy_device_to_host()
         rhs_copy = self.res.get_array().copy()
 
+        # Step 2: Solve augmented system
         self.solver.solve(self.res, self.px)
 
-        # Section 3.10: iterative refinement on the full unreduced system
+        # Step 3: Iterative refinement on full 8-block system
         if (
             inertia_corrector is not None
             and mult_ind is not None
@@ -2109,57 +2139,8 @@ class Optimizer:
             self.px.copy_device_to_host()
             self._iterative_refinement(mu, mult_ind, rhs_copy)
 
+        # Step 4: Back-substitute for bound duals
         self.optimizer.compute_update(mu, self.vars, self.px, self.update)
-
-        # DEBUG: Newton step diagnostics (current-point quantities only)
-        if hasattr(self, "_debug_iter"):
-            x_arr = self.vars.get_solution().get_array()
-            dx_arr = self.update.get_solution().get_array()
-            px_arr = self.px.get_array()
-            if hasattr(self.solver, "hess"):
-                self.solver.hess.copy_data_device_to_host()
-                hdata = np.array(self.solver.hess.get_data())
-                K = csr_matrix(
-                    (hdata, self.solver.cols, self.solver.rowp),
-                    shape=(self.solver.nrows, self.solver.nrows),
-                )
-                Kpx = K.dot(px_arr)
-                lin_err = np.linalg.norm(Kpx - rhs_copy) / max(
-                    np.linalg.norm(rhs_copy), 1e-30
-                )
-                print(f"  [Newton] x={x_arr}, dx={dx_arr}")
-                print(f"  [Newton] rhs={rhs_copy}")
-                print(f"  [Newton] px={px_arr}")
-                print(f"  [Newton] ||K*px-rhs||/||rhs||={lin_err:.2e}")
-                print(f"  [Newton] diag(K)={K.diagonal()}")
-                print(f"  [Newton] zl={self.vars.get_zl()}, zu={self.vars.get_zu()}")
-                print(
-                    f"  [Newton] dzl={self.update.get_zl()}, dzu={self.update.get_zu()}"
-                )
-
-                # Per-primal KKT error at CURRENT point
-                g = np.array(self.grad.get_array())
-                zl_v = self.vars.get_zl()
-                zu_v = self.vars.get_zu()
-                problem_ref = self.mpi_problem if self.distribute else self.problem
-                mi = np.array(problem_ref.get_multiplier_indicator(), dtype=bool)
-                pi_idx = np.where(~mi)[0]
-                lbx = np.array(self.optimizer.get_lbx())
-                ubx = np.array(self.optimizer.get_ubx())
-                print(f"  [Newton] grad={g}")
-                for k, idx in enumerate(pi_idx):
-                    dual_err = abs(g[idx] - zl_v[k] + zu_v[k])
-                    sigma_k = 0.0
-                    if np.isfinite(lbx[k]):
-                        sigma_k += zl_v[k] / (x_arr[idx] - lbx[k])
-                    if np.isfinite(ubx[k]):
-                        sigma_k += zu_v[k] / (ubx[k] - x_arr[idx])
-                    print(
-                        f"  [Newton] primal[{k}] idx={idx}: "
-                        f"grad={g[idx]:.6f} zl={zl_v[k]:.6f} zu={zu_v[k]:.6f} "
-                        f"|dual_err|={dual_err:.6f} Sigma={sigma_k:.4f} "
-                        f"diag(K)={K.diagonal()[idx]:.4f}"
-                    )
 
     def _find_direction(
         self,
@@ -2177,8 +2158,11 @@ class Optimizer:
         This is the main "direction finding" routine called once per
         iteration.  Combines _factorize_kkt (assemble + inertia correction)
         with _solve_with_mu (RHS + back-solve + update extraction).
+
+        Returns True if factorization succeeded, False if inertia
+        correction failed (direction is unreliable and should not be used).
         """
-        self._factorize_kkt(
+        ok = self._factorize_kkt(
             x,
             diag_base,
             inertia_corrector,
@@ -2188,7 +2172,10 @@ class Optimizer:
             zero_hessian_eps,
             comm_rank,
         )
+        if not ok:
+            return False
         self._solve_with_mu(self.barrier_param, inertia_corrector, mult_ind)
+        return True
 
     def _print_newton_diagnostics(self, rhs_norm, res_norm_mu, mult_ind):
         """Print detailed Newton step diagnostics (check_update_step only).
@@ -2465,35 +2452,36 @@ class Optimizer:
         return alpha, max_iters, False
 
     def _compute_barrier_objective(self, vars):
-        """Compute the barrier objective: phi_mu(x) = f(x) - mu * sum(ln(s)).
+        """Barrier objective phi_mu = f(x) - mu * sum(ln(gaps)).
 
-        This is used as one of the two filter measures.  f(x) is extracted
-        from the Lagrangian L = f + lam^T c by subtracting the multiplier
-        term.  Requires _update_gradient() to have been called at vars.
+        f(x) is obtained by evaluating L(x, lam=0) = alpha * f(x).
         """
         problem = self.mpi_problem if self.distribute else self.problem
         x_vec = vars.get_solution()
+        x_arr = x_vec.get_array()
 
-        # L(x,lam) = f(x) + lam^T c(x)
-        lagr = problem.lagrangian(1.0, x_vec)
+        # Zero multipliers, evaluate L(x,0) = f(x), restore
+        mult_ind = np.array(
+            (
+                self.mpi_problem if self.distribute else self.problem
+            ).get_multiplier_indicator(),
+            dtype=bool,
+        )
+        lam_backup = x_arr[mult_ind].copy()
+        x_arr[mult_ind] = 0.0
+        x_vec.copy_host_to_device()
+        f_obj = problem.lagrangian(1.0, x_vec)
+        x_arr[mult_ind] = lam_backup
+        x_vec.copy_host_to_device()
 
-        # Subtract lam^T c(x): at constraint indices, g holds c(x) values
-        # and x holds the multiplier values
-        g = np.array(self.grad.get_array())
-        x_arr = np.array(x_vec.get_array())
-        mult_sum = np.dot(x_arr[self._filter_mult_ind], g[self._filter_mult_ind])
-        f_obj = lagr - mult_sum
-
-        # Barrier log terms: -mu * sum(ln(barrier_vars))
         barrier_log = self.optimizer.compute_barrier_log_sum(self.barrier_param, vars)
         return f_obj + barrier_log
 
     def _compute_filter_theta(self, vars=None):
-        """Compute theta = ||c(x)|| (barrier-independent constraint violation)."""
+        """Compute theta = ||c(x)||_1 (1-norm)."""
         if vars is None:
             vars = self.vars
-        _, primal_sq, _ = self.optimizer.compute_kkt_error(vars, self.grad)
-        return np.sqrt(primal_sq)
+        return self.optimizer.compute_constraint_violation_1norm(vars, self.grad)
 
     def _filter_line_search(
         self,
@@ -2506,27 +2494,12 @@ class Optimizer:
         mult_ind=None,
         phi_current=None,
     ):
-        """Algorithm A: filter line search (Wachter & Biegler 2006).
+        """Filter line search (Algorithm A, Wächter & Biegler 2006).
 
-        The filter tracks two measures at each iterate:
-          theta = ||c(x)||   -- constraint violation (barrier-independent)
-          phi   = f(x) - mu * sum(ln(s))  -- barrier objective
-
-        A trial step is accepted under one of two conditions:
-
-        Case 1 (switching): When theta is small (near-feasible) and the
-            search direction is a descent direction for phi, accept with
-            Armijo sufficient decrease on phi.  The filter is NOT augmented
-            (we trust that the step is making optimality progress).
-
-        Case 2 (filter): Accept if the trial point shows sufficient
-            decrease in EITHER theta OR phi, AND is acceptable to the
-            filter (not dominated by any previous entry).  The filter IS
-            augmented with the current (phi_k, theta_k).
-
-        Only the PRIMAL step size alpha is backtracked.
-        The dual step uses the full alpha_z from fraction-to-boundary,
-        since dual variables don't affect the filter measures.
+        Implements the filter line search from Wächter & Biegler 2006:
+        theta uses 1-norm, Compare_le tolerance in Armijo/sufficient-decrease,
+        post-acceptance filter augmentation via f-type and Armijo re-check,
+        and SOC acceptance uses the original alpha_primal_test.
 
         Parameters
         ----------
@@ -2548,37 +2521,32 @@ class Optimizer:
         Returns
         -------
         alpha : float
-            Accepted step size.
+            Accepted step size (fraction of alpha_x).
         line_iters : int
             Number of backtracking iterations.
         step_accepted : bool
             False if step was rejected (triggers restoration).
         """
-        # Filter line search constants
+        # Constants
         max_iters = options["max_line_search_iterations"]
-        backtrack = options["backtracking_factor"]  # alpha_red_factor = 0.5
-        gamma_theta = options["filter_gamma_theta"]  # 1e-5
-        gamma_phi = options["filter_gamma_phi"]  # 1e-8
-        delta = options["filter_delta"]  # 1.0
-        s_theta = options["filter_s_theta"]  # 1.1
-        s_phi = options["filter_s_phi"]  # 2.3
-        eta_phi = options["filter_eta_phi"]  # 1e-8
-        gamma_alpha = 0.05  # alpha_min_frac
-        max_soc = options["filter_max_soc"]  # 4
-        kappa_soc = options["filter_kappa_soc"]  # 0.99
+        alpha_red = options["backtracking_factor"]
+        gamma_theta = options["filter_gamma_theta"]
+        gamma_phi = options["filter_gamma_phi"]
+        delta = options["filter_delta"]
+        s_theta = options["filter_s_theta"]
+        s_phi = options["filter_s_phi"]
+        eta_phi = options["filter_eta_phi"]
+        alpha_min_frac = 0.05
+        max_soc = options["filter_max_soc"]
+        kappa_soc = options["filter_kappa_soc"]
+        obj_max_inc = 5.0
         use_soc = options["second_order_correction"] and mult_ind is not None
+        EPS10 = 10.0 * np.finfo(float).eps
 
-        # Current-point measures
-        theta_k = self._compute_filter_theta()
-        phi_k = phi_current
-
-        # theta_min and theta_max (Eq. 21)
-        theta_0 = getattr(self, "_filter_theta_0", theta_k)
-        theta_min = 1e-4 * max(1.0, theta_0)
-        theta_max = 1e4 * max(1.0, theta_0)
-
-        # Directional derivative of barrier objective (Eq. 19)
-        dphi = self.optimizer.compute_barrier_dphi(
+        # Reference values
+        ref_theta = self._compute_filter_theta()
+        ref_barr = phi_current
+        ref_dphi = self.optimizer.compute_barrier_dphi(
             self.barrier_param,
             self.vars,
             self.update,
@@ -2587,69 +2555,67 @@ class Optimizer:
             self.diag,
         )
 
+        # theta_min, theta_max (Eq. 21)
+        theta_0 = getattr(self, "_filter_theta_0", ref_theta)
+        theta_min = 1e-4 * max(1.0, theta_0)
+        theta_max = 1e4 * max(1.0, theta_0)
+
         # Alpha_min (Eq. 23)
-        alpha_min_val = gamma_theta
-        if dphi < 0:
-            alpha_min_val = min(gamma_theta, gamma_phi * theta_k / (-dphi))
-            if theta_k <= theta_min:
-                pow_dphi = (-dphi) ** s_phi
-                if pow_dphi > 1e-30:
-                    alpha_min_val = min(
-                        alpha_min_val,
-                        delta * theta_k**s_theta / pow_dphi,
-                    )
-        alpha_min_val *= gamma_alpha
+        alpha_min = gamma_theta
+        if ref_dphi < 0.0:
+            alpha_min = min(gamma_theta, gamma_phi * ref_theta / (-ref_dphi))
+            if ref_theta <= theta_min:
+                alpha_min = min(
+                    alpha_min,
+                    delta * ref_theta**s_theta / (-ref_dphi) ** s_phi,
+                )
+        alpha_min *= alpha_min_frac
 
-        if False:  # verbose filter debug
-            print(
-                f"  dphi={dphi:.2e}, theta_k={theta_k:.2e}, "
-                f"theta_min={theta_min:.2e}, mode=filter"
-            )
-
-        # F-type switching test (Eq. 19)
-        # Re-evaluated per backtracking step since alpha changes.
-        def _is_ftype(alpha_trial):
+        # f-type switching condition (Eq. 19)
+        def _is_ftype(alpha_test):
             return (
-                dphi < 0 and alpha_trial * (-dphi) ** s_phi > delta * theta_k**s_theta
+                ref_dphi < 0.0
+                and alpha_test * (-ref_dphi) ** s_phi > delta * ref_theta**s_theta
             )
 
-        # Acceptance test (Eqs. 18-20)
-        # Two-phase check: (1) acceptable to current iterate, then
-        # (2) acceptable to filter.  Both must pass.
-        obj_max_inc = 5.0  # max log10 increase in barrier obj
+        # Armijo condition (Eq. 20, with Compare_le)
+        def _armijo_holds(trial_barr, alpha_test):
+            return (
+                trial_barr - ref_barr
+            ) - eta_phi * alpha_test * ref_dphi <= EPS10 * abs(ref_barr)
 
-        def _acceptable_to_current(theta_t, phi_t, alpha_trial):
-            """Phase 1: acceptable to current iterate. Returns (ok, is_ftype)."""
-            # F-type: switching + Armijo (Eq. 20)
-            if alpha_trial > 0 and _is_ftype(alpha_trial) and theta_k <= theta_min:
-                armijo = phi_t <= phi_k + eta_phi * alpha_trial * dphi
-                return armijo, True
-            # H-type: sufficient decrease (Eq. 18)
-            # Guard against excessive objective increase
-            if phi_t > phi_k:
-                basval = max(1.0, np.log10(max(abs(phi_k), 1e-30)))
-                if np.log10(max(phi_t - phi_k, 1e-30)) > obj_max_inc + basval:
-                    return False, False
-            sufficient = (
-                theta_t <= (1.0 - gamma_theta) * theta_k
-                or phi_t <= phi_k - gamma_phi * theta_k
+        # Acceptable to current iterate (Eq. 18, with Compare_le)
+        def _acceptable_to_iterate(trial_barr, trial_theta):
+            if trial_barr > ref_barr:
+                basval = 1.0
+                if abs(ref_barr) > 10.0:
+                    basval = np.log10(abs(ref_barr))
+                if np.log10(max(trial_barr - ref_barr, 1e-300)) > obj_max_inc + basval:
+                    return False
+            return (
+                trial_theta - (1.0 - gamma_theta) * ref_theta <= EPS10 * abs(ref_theta)
+            ) or (
+                (trial_barr - ref_barr) - (-gamma_phi * ref_theta)
+                <= EPS10 * abs(ref_barr)
             )
-            return sufficient, False
 
-        def _check_acceptance(theta_t, phi_t, alpha_trial):
-            """Returns (accepted, is_ftype_accepted)."""
-            if theta_t > theta_max:
-                return False, False
-            # Phase 1: acceptable to current iterate
-            ok, is_ftype_flag = _acceptable_to_current(theta_t, phi_t, alpha_trial)
-            if not ok:
-                return False, False
-            # Phase 2: acceptable to filter
-            if not inner_filter.is_acceptable(phi_t, theta_t):
-                return False, False
-            return True, is_ftype_flag
+        # Check acceptability of trial point
+        def _check_acceptance(trial_barr, trial_theta, alpha_test):
+            if trial_theta > theta_max:
+                return False
+            if alpha_test > 0.0 and _is_ftype(alpha_test) and ref_theta <= theta_min:
+                return _armijo_holds(trial_barr, alpha_test)
+            if not _acceptable_to_iterate(trial_barr, trial_theta):
+                return False
+            return inner_filter.is_acceptable(trial_barr, trial_theta)
 
-        # SOC state
+        # Post-acceptance filter augmentation.
+        # Augment filter unless f-type and Armijo both hold.
+        def _update_filter(trial_barr, alpha_test):
+            if not (_is_ftype(alpha_test) and _armijo_holds(trial_barr, alpha_test)):
+                inner_filter.add(ref_barr, ref_theta)
+
+        # SOC state backup
         if use_soc:
             self.optimizer.compute_residual(
                 self.barrier_param, self.vars, self.grad, self.res
@@ -2659,60 +2625,46 @@ class Optimizer:
             update_backup.copy(self.update)
             px_orig = self.px.get_array().copy()
 
-        alpha = 1.0
-
         # Backtracking loop
-        for j in range(max_iters):
-            # Alpha_min check (at least one trial allowed)
-            if alpha * alpha_x < alpha_min_val and j > 0:
-                self._update_gradient(self.vars.get_solution())
-                return alpha, j, False
+        alpha_primal = alpha_x
+        n_steps = 0
 
-            # Trial point: only backtrack primal; dual uses full alpha_z
+        while alpha_primal > alpha_min or n_steps == 0:
+            if n_steps >= max_iters:
+                break
+
+            # Trial point
             self.optimizer.apply_step_update(
-                alpha * alpha_x,
-                alpha_z,
-                self.vars,
-                self.update,
-                self.temp,
+                alpha_primal, alpha_z, self.vars, self.update, self.temp
             )
             self._update_gradient(self.temp.get_solution())
 
-            _, primal_sq, _ = self.optimizer.compute_kkt_error(self.temp, self.grad)
-            theta_trial = np.sqrt(primal_sq)
-            phi_trial = self._compute_barrier_objective(self.temp)
+            trial_theta = self._compute_filter_theta(self.temp)
+            trial_barr = self._compute_barrier_objective(self.temp)
 
-            accepted, is_ftype = _check_acceptance(
-                theta_trial, phi_trial, alpha * alpha_x
-            )
+            alpha_primal_test = alpha_primal
 
-            if accepted:
-                # Augment filter for h-type, not f-type
-                if not is_ftype:
-                    inner_filter.add(phi_k, theta_k)
+            if _check_acceptance(trial_barr, trial_theta, alpha_primal_test):
+                _update_filter(trial_barr, alpha_primal_test)
                 self.vars.copy(self.temp)
-                return alpha, j + 1, True
+                return alpha_primal / alpha_x, n_steps + 1, True
 
-            # Second-order correction (Algorithm A, step A-5.5)
-            # Triggered on first trial when full step increased infeasibility.
-            if use_soc and j == 0 and alpha == 1.0 and theta_trial >= theta_k:
-                # SOC loop: up to max_soc corrections
-                # Build initial c_soc from trial constraint residual
+            # SOC (Algorithm A, step A-5.5): first trial, infeasibility increased
+            if use_soc and n_steps == 0 and trial_theta >= ref_theta:
                 self.optimizer.compute_residual(
                     self.barrier_param, self.temp, self.grad, self.res
                 )
                 c_soc = self.res.get_array().copy()
-                c_soc[~mult_ind] = res_orig[~mult_ind]  # keep stationarity
-                alpha_soc = alpha * alpha_x
-                theta_soc_old = theta_trial
-
+                c_soc[~mult_ind] = res_orig[~mult_ind]
+                alpha_soc = alpha_primal
+                theta_soc_old = trial_theta
                 soc_accepted = False
-                for soc_count in range(max_soc):
-                    if soc_count > 0 and theta_trial > kappa_soc * theta_soc_old:
-                        break
-                    theta_soc_old = theta_trial
 
-                    # Solve SOC direction with accumulated c_soc
+                for soc_count in range(max_soc):
+                    if soc_count > 0 and trial_theta > kappa_soc * theta_soc_old:
+                        break
+                    theta_soc_old = trial_theta
+
                     self.res.get_array()[:] = c_soc
                     self.res.copy_host_to_device()
                     self._update_gradient(self.vars.get_solution())
@@ -2732,16 +2684,13 @@ class Optimizer:
                         soc_ax, soc_az, self.vars, self.update, self.temp
                     )
                     self._update_gradient(self.temp.get_solution())
-                    _, p_sq, _ = self.optimizer.compute_kkt_error(self.temp, self.grad)
-                    theta_trial = np.sqrt(p_sq)
-                    phi_trial = self._compute_barrier_objective(self.temp)
 
-                    soc_ok, soc_ftype = _check_acceptance(
-                        theta_trial, phi_trial, soc_ax
-                    )
-                    if soc_ok:
-                        if not soc_ftype:
-                            inner_filter.add(phi_k, theta_k)
+                    trial_theta = self._compute_filter_theta(self.temp)
+                    trial_barr = self._compute_barrier_objective(self.temp)
+
+                    # Acceptance uses original alpha_primal_test
+                    if _check_acceptance(trial_barr, trial_theta, alpha_primal_test):
+                        _update_filter(trial_barr, alpha_primal_test)
                         self.vars.copy(self.temp)
                         soc_accepted = True
                         break
@@ -2751,28 +2700,23 @@ class Optimizer:
                         self.barrier_param, self.temp, self.grad, self.res
                     )
                     new_c = self.res.get_array().copy()
-                    c_soc[mult_ind] = soc_ax * c_soc[mult_ind] + new_c[mult_ind]
+                    c_soc[mult_ind] = alpha_soc * c_soc[mult_ind] + new_c[mult_ind]
                     alpha_soc = soc_ax
 
-                    pass  # SOC rejected, continue loop
-
                 if soc_accepted:
-                    return 1.0, j + 1, True
+                    return 1.0, n_steps + 1, True
 
-                # Restore original update for continued backtracking
+                # Restore original direction for continued backtracking
                 self.update.copy(update_backup)
                 self.px.get_array()[:] = px_orig
                 self.px.copy_host_to_device()
 
-            if j < max_iters - 1:
-                alpha *= backtrack
-                continue
+            alpha_primal *= alpha_red
+            n_steps += 1
 
-            # All backtracking exhausted
-            self._update_gradient(self.vars.get_solution())
-            return alpha, j + 1, False
-
-        return alpha, max_iters, False
+        # All backtracking exhausted — trigger restoration
+        self._update_gradient(self.vars.get_solution())
+        return alpha_primal / alpha_x, n_steps, False
 
     def _restoration_phase(
         self,
@@ -2934,8 +2878,7 @@ class Optimizer:
                         self.temp,
                     )
                     self._update_gradient(self.temp.get_solution())
-                    _, p_sq, _ = self.optimizer.compute_kkt_error(self.temp, self.grad)
-                    theta_trial = np.sqrt(p_sq)
+                    theta_trial = self._compute_filter_theta(self.temp)
 
                     if theta_trial < theta_k:
                         self.vars.copy(self.temp)
@@ -3016,26 +2959,40 @@ class Optimizer:
         if not self.distribute:
             xview = ModelVector(self.model, x=x)
 
-        # Initial iterate setup (Section 3.6):
+        # Iterate initialization sequence:
         #   1. Relax bounds
         #   2. Push x into bounds, set z = 1.0
-        #   3. Recompute gradient at pushed x
-        #   4. Least-squares constraint multiplier init
-        #   5. Recompute gradient at final (x, lam)
+        #   3. Initialize slacks to s = c(x), re-push into bounds
+        #   4. Recompute gradient at (pushed x, initialized s)
+        #   5. Least-squares constraint multiplier init
+        #   6. Recompute gradient at final (x, lam) for the main loop
 
-        # Step 1: Relax bounds (bound_relax_factor = 1e-8)
+        # Step 1: Relax bounds (default: bound_relax_factor = 1e-8)
         self.optimizer.relax_bounds(1e-8, options["constr_viol_tol"])
 
-        # Step 2: Project x into bounds, initialize z = 1.0
+        # Step 2: Project design variables into bounds, initialize z = 1.0
         self._zero_multipliers(x)
         self.optimizer.initialize_multipliers_and_slacks(
             self.barrier_param, self.grad, self.vars
         )
 
-        # Step 3: Recompute gradient at the pushed x with lam=0
+        # Step 3: Initialize slacks to s = d(x), then push into bounds.
+        # Set s = d(x), then push into bounds.
+        # Gradient is already evaluated at the pushed x from Step 2.
+        # initialize_slacks recovers d(x) = grad[ci] + s_old from the
+        # SlackCouplingGroup contribution (grad[ci] = c(x) - s_old).
+        if self.optimizer.has_slacks():
+            self._update_gradient(x)
+            self.optimizer.initialize_slacks(self.grad, self.vars)
+            x.copy_host_to_device()
+            self.optimizer.initialize_multipliers_and_slacks(
+                self.barrier_param, self.grad, self.vars
+            )
+
+        # Step 4: Recompute gradient at the pushed x with lam=0
         self._update_gradient(x)
 
-        # Step 4: Least-squares constraint multiplier initialization
+        # Step 5: Least-squares constraint multiplier initialization
         if options["init_affine_step_multipliers"]:
             self._compute_least_squares_multipliers()
             self.barrier_param = self._compute_affine_multipliers(
@@ -3044,8 +3001,10 @@ class Optimizer:
         elif options["init_least_squares_multipliers"]:
             self._compute_least_squares_multipliers()
 
-        # Step 5: Recompute gradient at (x, lam) for the main loop
+        # Step 6: Recompute gradient at final (x, lam) for the main loop
         self._update_gradient(x)
+
+        pass
 
         # Step size tracking (for log output)
         line_iters = 0
@@ -3073,14 +3032,7 @@ class Optimizer:
         mult_ind = np.array(problem_ref.get_multiplier_indicator(), dtype=bool)
         inertia_corrector = None
         if hasattr(self.solver, "get_inertia"):
-            inertia_corrector = InertiaCorrector(
-                mult_ind,
-                self.barrier_param,
-                options,
-                self.model,
-                self.solver,
-                self.distribute,
-            )
+            inertia_corrector = InertiaCorrector(mult_ind, self.barrier_param, options)
             if comm_rank == 0:
                 n_primal = int(np.sum(~mult_ind))
                 n_dual = int(np.sum(mult_ind))
@@ -3153,9 +3105,7 @@ class Optimizer:
         filter_monotone_mode = False  # True when filter rejected step
         filter_monotone_mu = None
 
-        # Multiplier indicator for barrier objective computation
         if filter_ls:
-            self._filter_mult_ind = mult_ind
             # Track theta_0 per barrier subproblem for switching condition
             self._filter_theta_0 = None  # set after first gradient eval
 
@@ -3201,7 +3151,6 @@ class Optimizer:
             if inertia_corrector:
                 iter_data.update(
                     {
-                        "eps_z": inertia_corrector.eps_z,
                         "theta": theta,
                         "eta": eta,
                         "inertia_delta": inertia_corrector.last_delta_w,
@@ -3390,6 +3339,7 @@ class Optimizer:
 
             # Step D+E: Barrier update + search direction
             step_rejected = False
+            factorize_ok = True
             if not filter_ls:
                 if inertia_corrector:
                     inertia_corrector.update_barrier(self.barrier_param)
@@ -3406,6 +3356,8 @@ class Optimizer:
                             zero_step_count = 0
                     else:
                         zero_step_count = 0
+
+            pass
 
             # Barrier diagonal Sigma (eq. 13).
             # compute_diagonal writes (not accumulates) each entry.
@@ -3496,7 +3448,7 @@ class Optimizer:
                             inertia_corrector.update_barrier(self.barrier_param)
                         inner_filter.entries.clear()
                         self._filter_theta_0 = self._compute_filter_theta()
-                self._find_direction(
+                factorize_ok = self._find_direction(
                     x,
                     diag_base,
                     inertia_corrector,
@@ -3522,7 +3474,7 @@ class Optimizer:
                 if inertia_corrector:
                     inertia_corrector.update_barrier(self.barrier_param)
 
-                self._find_direction(
+                factorize_ok = self._find_direction(
                     x,
                     diag_base,
                     inertia_corrector,
@@ -3533,7 +3485,7 @@ class Optimizer:
                     comm_rank,
                 )
             elif quality_func:
-                self._factorize_kkt(
+                factorize_ok = self._factorize_kkt(
                     x,
                     diag_base,
                     inertia_corrector,
@@ -3569,7 +3521,7 @@ class Optimizer:
                 if inertia_corrector:
                     inertia_corrector.update_barrier(self.barrier_param)
 
-                if not qf_free_mode:
+                if not qf_free_mode and factorize_ok:
                     self._solve_with_mu(self.barrier_param)
             else:
                 heuristic = options["barrier_strategy"] == "heuristic"
@@ -3604,7 +3556,7 @@ class Optimizer:
                         )
 
                 # Direction finding (regularize, factor, solve)
-                self._find_direction(
+                factorize_ok = self._find_direction(
                     x,
                     diag_base,
                     inertia_corrector,
@@ -3614,6 +3566,46 @@ class Optimizer:
                     zero_hessian_eps,
                     comm_rank,
                 )
+
+            # Inertia correction failed: skip line search, force rejection.
+            # This matches IPOPT's behavior where SolveOnce returns false
+            # and the step is not taken.
+            if not factorize_ok:
+                step_rejected = True
+                consecutive_rejections += 1
+                if comm_rank == 0:
+                    print(
+                        f"  Inertia correction FAILED " f"({consecutive_rejections}x)"
+                    )
+                # Restore barrier and skip to Step G
+                self.barrier_param = barrier_before
+                alpha = 0.0
+                line_iters = 0
+                alpha_x_prev = 0.0
+                alpha_z_prev = 0.0
+                x_index_prev = -1
+                z_index_prev = -1
+                # Handle rejection escape
+                if consecutive_rejections >= max_rejections:
+                    new_barrier = min(self.barrier_param * barrier_inc, initial_barrier)
+                    if new_barrier > self.barrier_param:
+                        consecutive_rejections = 0
+                        if comm_rank == 0:
+                            print(
+                                f"  Barrier increased: "
+                                f"{self.barrier_param:.2e} -> "
+                                f"{new_barrier:.2e}"
+                            )
+                        self.barrier_param = new_barrier
+                    else:
+                        consecutive_rejections = 0
+                        if comm_rank == 0:
+                            print(
+                                f"  Barrier at max "
+                                f"({self.barrier_param:.2e}), "
+                                f"cannot increase further"
+                            )
+                continue
 
             # Check the update (debug only)
             if options["check_update_step"]:
@@ -3710,9 +3702,8 @@ class Optimizer:
 
                 # Update gradient at the new point for the next iteration.
                 if step_accepted:
-                    # Eq. 16: reset bound multipliers after
-                    # step acceptance to prevent divergence. Clamps each z_i
-                    # to [mu/(kappa*gap), kappa*mu/gap] with kappa=1e10.
+                    # Eq. 16: reset bound multipliers to prevent divergence.
+                    # Clamps z_i to [mu/(kappa*gap), kappa*mu/gap] with kappa=1e10.
                     self.optimizer.reset_bound_multipliers(
                         self.barrier_param,
                         1e10,
@@ -3765,8 +3756,6 @@ class Optimizer:
                 if consecutive_rejections >= max_rejections:
                     new_barrier = min(self.barrier_param * barrier_inc, initial_barrier)
                     if new_barrier > self.barrier_param:
-                        if inertia_corrector:
-                            inertia_corrector.eps_z = inertia_corrector.cz * new_barrier
                         consecutive_rejections = 0
                         if comm_rank == 0:
                             print(
