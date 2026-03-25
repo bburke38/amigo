@@ -1,5 +1,5 @@
-#ifndef AMIGO_DIRICHLET_BCS_H
-#define AMIGO_DIRICHLET_BCS_H
+#ifndef AMIGO_FIXED_VARIABLES_H
+#define AMIGO_FIXED_VARIABLES_H
 
 #include <memory>
 
@@ -9,15 +9,14 @@
 
 namespace amigo {
 
-class DirichletBCs {
+class FixedVariables {
  public:
   template <typename T>
-  DirichletBCs(std::shared_ptr<Vector<int>> bcs_vec,
-               std::shared_ptr<CSRMat<T>> mat) {
+  FixedVariables(std::shared_ptr<Vector<int>> dofs,
+                 std::shared_ptr<CSRMat<T>> mat) {
     // Get the matrix data
     int nrows, ncols;
-    const int *rowp, *cols;
-    mat->get_data(&nrows, &ncols, &rowp, &cols, nullptr);
+    mat->get_data(&nrows, &ncols, nullptr, nullptr, nullptr, nullptr);
 
     int n = nrows;
     if (ncols > nrows) {
@@ -25,21 +24,27 @@ class DirichletBCs {
     }
 
     // Get the indices corresponding to the boundary conditions
-    int num_bcs = bcs_vec->get_size();
-    const int* bcs = bcs_vec->get_array();
+    int num_fixed = dofs->get_size();
+    const int* dof_array = dofs->get_array();
 
-    int* is_bc = new int[n];
-    std::fill(is_bc, is_bc + n, 0);
-    for (int i = 0; i < num_bcs; i++) {
-      if (bcs[i] >= 0 && bcs[i] < n) {
-        is_bc[bcs[i]] = 1;
+    int* is_fixed = new int[n];
+    std::fill(is_fixed, is_fixed + n, 0);
+    for (int i = 0; i < num_fixed; i++) {
+      // Get the global variable index
+      int dof = dof_array[i];
+
+      // Map to local variable
+      int dof_local = dof;
+
+      if (dof_local >= 0 && dof_local < n) {
+        is_fixed[dof_local] = 1;
       }
     }
 
     // Find the column locations
-    find_indices(is_bc, mat);
+    find_indices(is_fixed, mat);
 
-    delete[] is_bc;
+    delete[] is_fixed;
   }
 
   /**
@@ -49,7 +54,7 @@ class DirichletBCs {
    */
   template <ExecPolicy policy, typename T>
   void zero_rows(std::shared_ptr<Vector<T>> vec) {
-    vec->set_values<policy>(vec_zero_indices, T(0.0));
+    vec->template set_values<policy>(vec_zero_indices, T(0.0));
   }
 
   /**
@@ -59,8 +64,8 @@ class DirichletBCs {
    */
   template <ExecPolicy policy, typename T>
   void zero_rows_and_columns(std::shared_ptr<CSRMat<T>> mat) {
-    mat->set_values<policy>(mat_zero_indices, T(0.0));
-    mat->set_values<policy>(mat_diag_indices, T(1.0));
+    mat->template set_values<policy>(mat_zero_indices, T(0.0));
+    mat->template set_values<policy>(mat_diag_indices, T(1.0));
   }
 
   /**
@@ -76,28 +81,28 @@ class DirichletBCs {
   /**
    * @brief Find the locations where to zero column entries within the matrix
    *
-   * @param is_bc Is the boundary condition? The array must be of length
+   * @param is_fixed Is the variable fixed? The array must be of length
    * max(nrows, ncols).
    * @param mat The matrix
    */
   template <typename T>
-  void find_indices(const int is_bc[], std::shared_ptr<CSRMat<T>> mat) {
+  void find_indices(const int is_fixed[], std::shared_ptr<CSRMat<T>> mat) {
     // Get the matrix data
     int nrows, ncols;
     const int *rowp, *cols;
-    mat->get_data(&nrows, &ncols, &rowp, &cols, nullptr);
+    mat->get_data(&nrows, &ncols, nullptr, &rowp, &cols, nullptr);
 
     int nzeros = 0;
     int ndiag = 0;
     for (int i = 0; i < nrows; i++) {
-      if (!is_bc[i]) {
+      if (!is_fixed[i]) {
         for (int jp = rowp[i]; jp < rowp[i + 1]; jp++) {
           int j = cols[jp];
-          if (is_bc[j]) {
+          if (is_fixed[j]) {
             nzeros++;
           }
         }
-      } else if (is_bc[i]) {
+      } else if (is_fixed[i]) {
         for (int jp = rowp[i]; jp < rowp[i + 1]; jp++) {
           int j = cols[jp];
           if (i == j) {
@@ -120,15 +125,15 @@ class DirichletBCs {
     nzeros = 0;
     ndiag = 0;
     for (int i = 0; i < nrows; i++) {
-      if (!is_bc[i]) {
+      if (!is_fixed[i]) {
         for (int jp = rowp[i]; jp < rowp[i + 1]; jp++) {
           int j = cols[jp];
-          if (is_bc[j]) {
+          if (is_fixed[j]) {
             zero_array[nzeros] = jp;
             nzeros++;
           }
         }
-      } else if (is_bc[i]) {
+      } else if (is_fixed[i]) {
         for (int jp = rowp[i]; jp < rowp[i + 1]; jp++) {
           int j = cols[jp];
           if (i == j) {
@@ -151,4 +156,4 @@ class DirichletBCs {
 
 }  // namespace amigo
 
-#endif  // AMIGO_DIRICHLET_BCS_H
+#endif  // AMIGO_FIXED_VARIABLES_H
