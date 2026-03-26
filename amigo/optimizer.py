@@ -349,9 +349,9 @@ class MumpsSolver(_HessianDiagMixin):
         self._mumps.icntl[9] = 0  # ICNTL(10): no iterative refinement
         self._mumps.icntl[12] = 1  # ICNTL(13): proper inertia detection
         self._mumps.icntl[13] = 1000  # ICNTL(14): workspace increase %
-        # ICNTL(24) = 0: do NOT enable null pivot detection during normal
-        # factorization (matches IPOPT).  When enabled, near-zero negative
-        # pivots can be misclassified as "null", corrupting the inertia count.
+        # ICNTL(24) = 0: null pivot detection off during normal factorization.
+        # When enabled, near-zero negative pivots can be misclassified as
+        # "null", corrupting the inertia count.
         self._mumps.icntl[23] = 0  # ICNTL(24): null pivot detection OFF
         self._mumps.cntl[0] = 1e-6  # CNTL(1):  pivot tolerance
 
@@ -603,8 +603,8 @@ class MumpsSolver(_HessianDiagMixin):
         """Return (n_positive, n_negative) from MUMPS infog(12).
 
         infog(12) = number of negative pivots in LDL^T factorization.
-        With ICNTL(24)=0 (null pivot detection off, matching IPOPT),
-        all pivots are classified as positive or negative.
+        With ICNTL(24)=0 (null pivot detection off), all pivots are
+        classified as positive or negative.
         """
         n_neg = int(self._mumps.infog[11])
         n_pos = self.nrows - n_neg
@@ -1111,10 +1111,8 @@ class InertiaCorrector:
         """
         self._finalize_test()
 
-        # Note: pivot tolerance is NOT reset here — it persists across
-        # iterations, matching IPOPT's ConsiderNewSystem behavior.  Once
-        # IncreaseQuality raises pivtol, the solver keeps the more
-        # accurate setting for subsequent systems.
+        # Pivot tolerance persists across iterations.  Once IncreaseQuality
+        # raises pivtol, the solver keeps the tighter setting.
 
         # Save last perturbation
         if self._delta_x_curr > 0.0:
@@ -1585,14 +1583,28 @@ class Optimizer:
             "barrier_increase_factor": 5.0,  # Barrier *= this when stuck
             "max_inertia_corrections": 40,
             "inertia_tolerance": 0,  # Allow n_pos/n_neg to differ by this many from expected
+            # Adaptive barrier (quality_function strategy)
+            "mu_max_fact": 1e3,  # mu_max = mu_max_fact * initial_avg_comp
+            "mu_min": 1e-11,  # absolute floor for mu
+            "mu_linear_decrease_factor": 0.2,  # kappa_mu for monotone decrease
+            "mu_superlinear_decrease_power": 1.5,  # theta_mu for superlinear
+            "barrier_tol_factor": 10.0,  # kappa_eps: reduce when E_mu <= kappa_eps*mu
+            "adaptive_mu_globalization": "kkt-error",  # "kkt-error" or "obj-constr-filter" or "never-monotone"
+            "adaptive_mu_kkterror_red_iters": 4,  # l_max reference values
+            "adaptive_mu_kkterror_red_fact": 0.9999,  # kappa_red
+            "adaptive_mu_monotone_init_factor": 0.8,  # mu_bar = factor * avg_comp
+            "adaptive_mu_safeguard_factor": 0.0,  # 0 = disabled
             "quality_function_sigma_max": 4.0,
+            "quality_function_sigma_min": 1e-6,
+            "quality_function_section_sigma_tol": 1e-2,
+            "quality_function_section_qf_tol": 0.0,
             "quality_function_golden_iters": 12,
-            "quality_function_kappa_free": 0.9999,
-            "quality_function_l_max": 5,
             "quality_function_norm_scaling": True,
+            "quality_function_centrality": "none",  # "none","log","reciprocal","cubed-reciprocal"
+            "quality_function_balancing_term": "none",  # "none","cubic"
             "quality_function_predictor_corrector": True,
-            "pc_kappa_mu_decay": 0.2,
             "nlp_scaling_max_gradient": 100.0,
+            "debug_cycling": False,
         }
 
         for name in options:
@@ -1626,83 +1638,130 @@ class Optimizer:
         barrier_tol = kappa_epsilon * barrier_param
         return res_norm <= barrier_tol
 
-    def _golden_section_search(self, f, a, b, n_iters=12):
-        """Golden section search for minimum of f on [a, b].
+    # Quality-function mu oracle
 
-        Returns (x_opt, f_opt).
+    @staticmethod
+    def _golden_section(f, a, b, sigma_tol, qf_tol, max_iters):
+        """Golden-section search for minimum of *f* on [a, b].
+
+        Stops when the sigma interval is small enough, the quality-function
+        values have converged, or *max_iters* is reached.
+
+        Returns *(sigma_opt, qf_opt)*.
         """
-        gr = (np.sqrt(5.0) + 1.0) / 2.0
-        c = b - (b - a) / gr
-        d = a + (b - a) / gr
-        fc = f(c)
-        fd = f(d)
+        gfac = (3.0 - np.sqrt(5.0)) / 2.0  # ≈ 0.382
+        sigma_lo, sigma_up = a, b
+        sigma_mid1 = sigma_lo + gfac * (sigma_up - sigma_lo)
+        sigma_mid2 = sigma_lo + (1.0 - gfac) * (sigma_up - sigma_lo)
+        q_lo = f(sigma_lo)
+        q_up = f(sigma_up)
+        qmid1 = f(sigma_mid1)
+        qmid2 = f(sigma_mid2)
 
-        for _ in range(n_iters):
-            if b - a < b * 1e-2:
+        for _ in range(max_iters):
+            width = sigma_up - sigma_lo
+            if width < sigma_tol * sigma_up:
                 break
-            if fc < fd:
-                b = d
-                d = c
-                fd = fc
-                c = b - (b - a) / gr
-                fc = f(c)
+            q_all = (q_lo, q_up, qmid1, qmid2)
+            qmin, qmax = min(q_all), max(q_all)
+            if qmax > 0 and 1.0 - qmin / qmax < qf_tol:
+                break
+            if qmid1 > qmid2:
+                sigma_lo = sigma_mid1
+                q_lo = qmid1
+                sigma_mid1 = sigma_mid2
+                qmid1 = qmid2
+                sigma_mid2 = sigma_lo + (1.0 - gfac) * (sigma_up - sigma_lo)
+                qmid2 = f(sigma_mid2)
             else:
-                a = c
-                c = d
-                fc = fd
-                d = a + (b - a) / gr
-                fd = f(d)
+                sigma_up = sigma_mid2
+                q_up = qmid2
+                sigma_mid2 = sigma_mid1
+                qmid2 = qmid1
+                sigma_mid1 = sigma_lo + gfac * (sigma_up - sigma_lo)
+                qmid1 = f(sigma_mid1)
 
-        return (c, fc) if fc < fd else (d, fd)
+        # Return the best point among all four
+        best_sigma, best_q = sigma_lo, q_lo
+        for s, q in ((sigma_mid1, qmid1), (sigma_mid2, qmid2), (sigma_up, q_up)):
+            if q < best_q:
+                best_sigma, best_q = s, q
+        return best_sigma, best_q
 
-    def _compute_quality_function_barrier(
-        self,
-        tau_min,
-        use_adaptive_tau,
-        options,
-        comm_rank,
+    def _evaluate_quality_function(
+        self, sigma, px0, dpx, mu_nat, tau, dual_inf, primal_inf, comp_inf,
+        qf_sd, qf_sp, qf_sc, centrality, balancing_term,
     ):
-        """Choose barrier parameter via Mehrotra predictor-corrector or golden section.
+        """Evaluate the quality function q_L(sigma).
 
-        Two directions are computed from the already-factorized KKT matrix:
-          px0 : affine-scaling direction (mu=0)
-          px1 : centering direction      (mu=avg_comp)
-          dpx = px1 - px0
+        The combined step is ``px(sigma) = px_aff + sigma * (px_cen - px_aff)``,
+        i.e. the exact KKT solution at ``mu = sigma * avg_comp``.
 
-        The corrector direction at any mu_pc is exactly px0 + (mu_pc/mu_nat)*dpx
-        because the KKT RHS is affinely linear in mu: r(mu) = r(0) + (mu/mu_nat)*r(mu_nat).
-        No additional factorization is required.
+        Returns a scalar quality value.
+        """
+        mu_s = sigma * mu_nat
+        self.px.get_array()[:] = px0 + sigma * dpx
+        self.px.copy_host_to_device()
+        self.optimizer.compute_update(mu_s, self.vars, self.px, self.update)
+        alpha_x, _, alpha_z, _ = self.optimizer.compute_max_step(
+            tau, self.vars, self.update
+        )
+        self.optimizer.apply_step_update(
+            alpha_x, alpha_z, self.vars, self.update, self.temp
+        )
+        trial_comp_sq = self.optimizer.compute_complementarity_sq(self.temp)
 
-        Mehrotra predictor-corrector (default):
-          1. Affine max-step alpha_aff from px0 direction.
-          2. Trial affine complementarity comp_aff.
-          3. sigma_pc = min(1, (comp_aff / comp)^3)  [Nocedal & Wright, Alg 14.3]
-          4. Corrector = px0 + sigma_pc * dpx.
+        qf = (
+            (1.0 - alpha_z) ** 2 * dual_inf * qf_sd
+            + (1.0 - alpha_x) ** 2 * primal_inf * qf_sp
+            + trial_comp_sq * qf_sc
+        )
 
-        Golden-section fallback (quality_function_predictor_corrector=False):
-          Searches sigma in [sigma_min, sigma_max] minimizing q_L(sigma).
+        # Centrality penalty
+        if centrality != "none" and trial_comp_sq > 0:
+            trial_comp, trial_xi = self.optimizer.compute_complementarity(self.temp)
+            trial_xi = max(trial_xi, 1e-30)
+            if centrality == "log":
+                qf -= trial_comp_sq * qf_sc * np.log(trial_xi)
+            elif centrality == "reciprocal":
+                qf += trial_comp_sq * qf_sc / trial_xi
+            elif centrality == "cubed-reciprocal":
+                qf += trial_comp_sq * qf_sc / trial_xi**3
+
+        # Balancing term
+        if balancing_term == "cubic":
+            d_term = (1.0 - alpha_z) ** 2 * dual_inf * qf_sd
+            p_term = (1.0 - alpha_x) ** 2 * primal_inf * qf_sp
+            c_term = trial_comp_sq * qf_sc
+            qf += max(0.0, max(d_term, p_term) - c_term) ** 3
+
+        return qf
+
+    def _compute_quality_function_mu(self, mu_min, mu_max, options, comm_rank):
+        """Compute new mu via Mehrotra PC or golden-section quality function.
+
+        Returns *(sigma, new_mu)* or *None* on failure.  The search
+        direction ``self.px`` and ``self.update`` are set to the
+        combined step at the returned mu.
         """
         avg_comp, xi = self.optimizer.compute_complementarity(self.vars)
         if avg_comp < 1e-30:
             return 1.0, self.barrier_param
+        mu_nat = avg_comp  # current average complementarity
 
-        mu_nat = avg_comp  # x^T z / n
-
-        # Affine-scaling RHS (mu=0) and dual/primal infeasibility norms
+        # --- Solve the two linear systems (one factorization) -----------
+        # px0: affine-scaling direction (mu = 0)
         self.optimizer.compute_residual(0.0, self.vars, self.grad, self.res)
-        dual_infeas_sq, primal_infeas_sq, _ = self.optimizer.compute_kkt_error(
+        dual_inf, primal_inf, _ = self.optimizer.compute_kkt_error(
             self.vars, self.grad
         )
-
-        # Delta(0): affine scaling direction (mu=0)
-        rhs0 = self.res.get_array().copy()
         if hasattr(self.solver, "solve_array"):
-            px0 = self.solver.solve_array(rhs0).copy()
+            px0 = self.solver.solve_array(self.res.get_array().copy()).copy()
         else:
             self.solver.solve(self.res, self.px)
             px0 = self.px.get_array().copy()
 
-        # Delta(1): centering direction (mu=avg_comp)
+        # px1: centering direction (mu = avg_comp)
         self.optimizer.compute_residual(mu_nat, self.vars, self.grad, self.res)
         if hasattr(self.solver, "solve_array"):
             px1 = self.solver.solve_array(self.res.get_array().copy()).copy()
@@ -1710,104 +1769,199 @@ class Optimizer:
             self.solver.solve(self.res, self.px)
             px1 = self.px.get_array().copy()
 
-        dpx = px1 - px0
+        dpx = px1 - px0  # centering component
 
-        tol_qf = options["convergence_tolerance"]
-        mu_floor = tol_qf * 0.1  # don't drive mu far below convergence tolerance
-
-        tau_qf = options["fraction_to_boundary"]
-
-        # Branch A: Mehrotra predictor-corrector
+        # --- Branch A: Mehrotra predictor-corrector (default) -----------
         if options["quality_function_predictor_corrector"]:
-            # Affine update: compute full primal-dual step from px0
+            # Affine step sizes (tau=1.0 for the probe)
             self.px.get_array()[:] = px0
             self.px.copy_host_to_device()
             self.optimizer.compute_update(0.0, self.vars, self.px, self.update)
             alpha_aff_x, _, alpha_aff_z, _ = self.optimizer.compute_max_step(
-                tau_qf, self.vars, self.update
+                1.0, self.vars, self.update  # tau = 1.0 for affine probe
             )
-            # Trial affine point -> complementarity
+            # Trial affine complementarity
             self.optimizer.apply_step_update(
                 alpha_aff_x, alpha_aff_z, self.vars, self.update, self.temp
             )
-            avg_comp_aff, _ = self.optimizer.compute_complementarity(self.temp)
+            mu_aff, _ = self.optimizer.compute_complementarity(self.temp)
 
-            # Mehrotra centering parameter (Nocedal-Wachter-Waltz, eq 3.5).
-            # Pure data-driven: sigma small when affine step reduces comp well,
-            # large when it doesn't.  Free/fixed mode toggle provides robustness.
-            sigma_pc = min(1.0, max(0.0, avg_comp_aff / mu_nat) ** 3)
-            mu_pc = max(sigma_pc * mu_nat, mu_floor)
+            # Mehrotra sigma = (mu_aff / mu_curr)^3, capped at sigma_max
+            sigma_max = options["quality_function_sigma_max"]
+            sigma = min((mu_aff / mu_nat) ** 3, sigma_max)
+            new_mu = sigma * mu_nat
 
-            if comm_rank == 0:
+            # Clamp to [mu_min, mu_max]
+            new_mu = max(new_mu, mu_min)
+            new_mu = min(new_mu, mu_max)
+
+            if comm_rank == 0 and options.get("verbose_barrier"):
                 print(
-                    f"  PC: sigma={sigma_pc:.4f}, "
-                    f"mu={mu_pc:.4e} "
-                    f"(comp={avg_comp:.4e}, "
-                    f"a_aff={alpha_aff_x:.3f})"
+                    f"  PC: sigma={sigma:.4f}, mu={new_mu:.3e} "
+                    f"(comp={avg_comp:.3e}, mu_aff={mu_aff:.3e}, "
+                    f"a_aff=[{alpha_aff_x:.3f},{alpha_aff_z:.3f}])"
                 )
 
-            # Corrector direction: px0 + sigma_pc*dpx is the exact KKT solution at
-            # mu=mu_pc (no extra factorization; linearity of r(mu) in mu guarantees
-            # this is identical to re-solving K p = r(mu_pc) from scratch).
-            self.px.get_array()[:] = px0 + sigma_pc * dpx
+            # Set combined step direction at new_mu
+            sigma_eff = new_mu / mu_nat if mu_nat > 0 else sigma
+            self.px.get_array()[:] = px0 + sigma_eff * dpx
             self.px.copy_host_to_device()
-            self.optimizer.compute_update(mu_pc, self.vars, self.px, self.update)
-            return sigma_pc, mu_pc
+            self.optimizer.compute_update(new_mu, self.vars, self.px, self.update)
 
-        # Branch B: golden-section search over q_L(sigma)
-        sigma_min_floor = (mu_floor / mu_nat) if mu_nat > mu_floor else 1e-6
-        sigma_min = max(1e-6, sigma_min_floor)
+            # Store affine step for potential corrector use
+            self._delta_aff = px0.copy()
+            return sigma, new_mu
+
+        # --- Branch B: Golden-section quality function search -----------
+        tau_qf = options["fraction_to_boundary"]
+        sigma_min = max(options["quality_function_sigma_min"], mu_min / mu_nat if mu_nat > mu_min else 1e-6)
         sigma_max = options["quality_function_sigma_max"]
-        n_gs_iters = options["quality_function_golden_iters"]
+        n_gs = options["quality_function_golden_iters"]
+        sigma_tol = options["quality_function_section_sigma_tol"]
+        qf_tol = options["quality_function_section_qf_tol"]
+        centrality = options["quality_function_centrality"]
+        balancing = options["quality_function_balancing_term"]
+        qf_sd, qf_sp, qf_sc = self._qf_sd, self._qf_sp, self._qf_sc
 
-        qf_sd = self._qf_sd
-        qf_sp = self._qf_sp
-        qf_sc = self._qf_sc
-
-        def eval_qf(sigma):
-            """Evaluate the linear quality function q_L(sigma)."""
-            mu_s = max(sigma * mu_nat, mu_floor)
-            self.px.get_array()[:] = px0 + sigma * dpx
-            self.px.copy_host_to_device()
-            self.optimizer.compute_update(mu_s, self.vars, self.px, self.update)
-            alpha_x, _, alpha_z, _ = self.optimizer.compute_max_step(
-                tau_qf, self.vars, self.update
-            )
-            self.optimizer.apply_step_update(
-                alpha_x, alpha_z, self.vars, self.update, self.temp
-            )
-            trial_comp_sq = self.optimizer.compute_complementarity_sq(self.temp)
-            return (
-                (1.0 - alpha_z) ** 2 * dual_infeas_sq * qf_sd
-                + (1.0 - alpha_x) ** 2 * primal_infeas_sq * qf_sp
-                + trial_comp_sq * qf_sc
+        def _eval(sigma):
+            return self._evaluate_quality_function(
+                sigma, px0, dpx, mu_nat, tau_qf,
+                dual_inf, primal_inf, 0.0,
+                qf_sd, qf_sp, qf_sc, centrality, balancing,
             )
 
-        qL_099 = eval_qf(0.99)
-        qL_1 = eval_qf(1.0)
+        # Determine search direction by testing slope at sigma=1
+        tol_probe = max(1e-4, sigma_tol)
+        qf_1 = _eval(1.0)
+        qf_1m = _eval(1.0 - tol_probe)
 
-        if qL_099 <= qL_1:
-            sigma_star, _ = self._golden_section_search(
-                eval_qf, sigma_min, 1.0, n_iters=n_gs_iters
+        if qf_1m > qf_1:
+            # QF decreases for sigma > 1 → search [1, sigma_max]
+            sigma_star, _ = self._golden_section(
+                _eval, 1.0, sigma_max, sigma_tol, qf_tol, n_gs
             )
         else:
-            sigma_star, _ = self._golden_section_search(
-                eval_qf, 1.0, sigma_max, n_iters=n_gs_iters
+            # QF decreases for sigma < 1 → search [sigma_min, 1]
+            sigma_star, _ = self._golden_section(
+                _eval, sigma_min, 1.0, sigma_tol, qf_tol, n_gs
             )
 
-        mu_new = sigma_star * mu_nat
+        new_mu = sigma_star * mu_nat
+        new_mu = max(new_mu, mu_min)
+        new_mu = min(new_mu, mu_max)
 
-        if comm_rank == 0:
+        if comm_rank == 0 and options.get("verbose_barrier"):
             print(
-                f"  QF: sigma={sigma_star:.4f}, "
-                f"mu={mu_new:.4e} (comp={avg_comp:.4e})"
+                f"  QF: sigma={sigma_star:.4f}, mu={new_mu:.3e} "
+                f"(comp={avg_comp:.3e})"
             )
 
-        self.px.get_array()[:] = px0 + sigma_star * dpx
+        sigma_eff = new_mu / mu_nat if mu_nat > 0 else sigma_star
+        self.px.get_array()[:] = px0 + sigma_eff * dpx
         self.px.copy_host_to_device()
-        self.optimizer.compute_update(mu_new, self.vars, self.px, self.update)
+        self.optimizer.compute_update(new_mu, self.vars, self.px, self.update)
+        return sigma_star, new_mu
 
-        return sigma_star, mu_new
+    def _adaptive_mu_quality_function_pd(self, mult_ind, options):
+        """Compute the KKT quality measure for globalization.
+
+        Uses 2-norm-squared scaled by element counts (default).
+        """
+        dual_sq, primal_sq, comp_sq = self.optimizer.compute_kkt_error(
+            self.vars, self.grad
+        )
+        qf = dual_sq * self._qf_sd + primal_sq * self._qf_sp + comp_sq * self._qf_sc
+
+        # Centrality penalty
+        centrality = options["quality_function_centrality"]
+        if centrality != "none" and comp_sq > 0:
+            _, xi = self.optimizer.compute_complementarity(self.vars)
+            xi = max(xi, 1e-30)
+            c_term = comp_sq * self._qf_sc
+            if centrality == "log":
+                qf -= c_term * np.log(xi)
+            elif centrality == "reciprocal":
+                qf += c_term / xi
+            elif centrality == "cubed-reciprocal":
+                qf += c_term / xi**3
+
+        # Balancing term
+        if options["quality_function_balancing_term"] == "cubic":
+            d_term = dual_sq * self._qf_sd
+            p_term = primal_sq * self._qf_sp
+            c_term = comp_sq * self._qf_sc
+            qf += max(0.0, max(d_term, p_term) - c_term) ** 3
+
+        return qf
+
+    def _adaptive_mu_check_sufficient_progress(self, options):
+        """Check if free mode is making sufficient progress."""
+        glob = options["adaptive_mu_globalization"]
+
+        if glob == "never-monotone":
+            return True
+
+        if glob == "kkt-error":
+            refs = self._qf_refs
+            num_refs_max = options["adaptive_mu_kkterror_red_iters"]
+            if len(refs) < num_refs_max:
+                return True
+            curr_error = self._adaptive_mu_quality_function_pd(None, options)
+            red_fact = options["adaptive_mu_kkterror_red_fact"]
+            for ref_val in refs:
+                if curr_error <= red_fact * ref_val:
+                    return True
+            return False
+
+        if glob == "obj-constr-filter":
+            # Simple 2D filter on (f, theta)
+            f_curr = self._compute_barrier_objective(self.vars)
+            theta_curr = self._compute_filter_theta()
+            margin = options.get("filter_margin_fact", 1e-5) * min(
+                options.get("filter_max_margin", 1.0),
+                max(f_curr, theta_curr, 1e-30),
+            )
+            for f_filt, theta_filt in self._qf_glob_filter:
+                if (f_curr + margin < f_filt or theta_curr + margin < theta_filt):
+                    return True
+            return len(self._qf_glob_filter) == 0
+
+        return True
+
+    def _adaptive_mu_remember_point(self, options):
+        """Record current point as accepted for globalization."""
+        glob = options["adaptive_mu_globalization"]
+
+        if glob == "kkt-error":
+            curr_error = self._adaptive_mu_quality_function_pd(None, options)
+            num_refs_max = options["adaptive_mu_kkterror_red_iters"]
+            if len(self._qf_refs) >= num_refs_max:
+                self._qf_refs.pop(0)
+            self._qf_refs.append(curr_error)
+
+        elif glob == "obj-constr-filter":
+            f_curr = self._compute_barrier_objective(self.vars)
+            theta_curr = self._compute_filter_theta()
+            self._qf_glob_filter.append((f_curr, theta_curr))
+
+    def _adaptive_mu_lower_safeguard(self, options):
+        """Compute lower mu safeguard based on infeasibility progress."""
+        factor = options["adaptive_mu_safeguard_factor"]
+        if factor == 0.0:
+            return 0.0
+
+        d_inf, p_inf, _ = self.optimizer.compute_kkt_error_mu(
+            0.0, self.vars, self.grad
+        )
+        safe = max(
+            factor * d_inf / max(self._qf_init_dual_inf, 1.0),
+            factor * p_inf / max(self._qf_init_primal_inf, 1.0),
+        )
+
+        if options["adaptive_mu_globalization"] == "kkt-error" and self._qf_refs:
+            safe = min(safe, min(self._qf_refs))
+
+        return safe
 
     def _compute_least_squares_multipliers(self, lambda_max=1e3):
         """Least-squares constraint multiplier initialization (Section 3.6).
@@ -2407,18 +2561,19 @@ class Optimizer:
             ):
                 soc_attempted = True
                 try:
-                    # self.res already holds the residual at self.temp (the trial
-                    # point), computed just above for res_new. Its constraint rows
-                    # [mult_ind] capture c(x+dx) — the nonlinear correction that SOC
-                    # is designed to exploit. Replace only the primal stationarity
-                    # rows [~mult_ind] with those from the current point (res_orig),
-                    # which are unchanged by the step.
-                    res_arr = self.res.get_array()
-                    res_arr[~mult_ind] = res_orig[~mult_ind]
+                    # SOC RHS: c_soc = c(trial) + alpha * c(curr)
+                    # SOC RHS: constraint rows get the accumulated nonlinear
+                    # correction; stationarity and complementarity rows stay
+                    # at the current point.
+                    res_arr = self.res.get_array()  # residual at trial
+                    c_soc = res_orig.copy()
+                    c_soc[mult_ind] = (
+                        res_arr[mult_ind] + alpha * res_orig[mult_ind]
+                    )
+                    self.res.get_array()[:] = c_soc
                     self.res.copy_host_to_device()
 
-                    # Restore gradient to current point before back-solve so that
-                    # compute_update uses the correct stationarity residual.
+                    # Restore gradient to current point before back-solve
                     self._update_gradient(self.vars.get_solution())
 
                     # Back-solve (reuses existing factorization)
@@ -2430,7 +2585,7 @@ class Optimizer:
                         self.update,
                     )
 
-                    # SOC trial
+                    # SOC trial point (from current iterate, not from trial)
                     soc_ax, _, soc_az, _ = self.optimizer.compute_max_step(
                         tau, self.vars, self.update
                     )
@@ -2689,15 +2844,24 @@ class Optimizer:
                 self.vars.copy(self.temp)
                 return alpha_primal / alpha_x, n_steps + 1, True
 
-            # SOC (Algorithm A, step A-5.5): first trial, infeasibility increased
+            # SOC: second-order correction for the Maratos effect.
+            #
+            # When the first full step is rejected because infeasibility
+            # increased, the SOC corrects the nonlinear constraint error
+            # that the linear Newton step misses.
+            #
+            # The key formula is:
+            #   c_soc_0 = c(x_k)                        [current constraints]
+            #   c_soc_i = c(x_trial_i) + alpha_i * c_soc_{i-1}   [accumulate]
+            #   RHS = [grad_lag(x_k), c_soc_i, compl(x_k)]
+            #   Solve K * delta_soc = -RHS
+            #   x_trial = x_k + alpha_soc * delta_soc
+            #
             if use_soc and n_steps == 0 and trial_theta >= ref_theta:
-                self.optimizer.compute_residual(
-                    self.barrier_param, self.temp, self.grad, self.res
-                )
-                c_soc = self.res.get_array().copy()
-                c_soc[~mult_ind] = res_orig[~mult_ind]
+                # Initialize c_soc to current-point constraint residual
+                c_soc = res_orig.copy()  # full residual at current point
                 alpha_soc = alpha_primal
-                theta_soc_old = trial_theta
+                theta_soc_old = 0.0
                 soc_accepted = False
 
                 for soc_count in range(max_soc):
@@ -2705,6 +2869,20 @@ class Optimizer:
                         break
                     theta_soc_old = trial_theta
 
+                    # Accumulate before solve: c_soc = c(trial) + alpha_soc * c_soc
+                    # Only the constraint rows change; stationarity and
+                    # complementarity rows stay at the current point.
+                    self.optimizer.compute_residual(
+                        self.barrier_param, self.temp, self.grad, self.res
+                    )
+                    trial_res = self.res.get_array().copy()
+                    c_soc[mult_ind] = (
+                        trial_res[mult_ind] + alpha_soc * c_soc[mult_ind]
+                    )
+                    # Stationarity and complementarity rows stay from current point
+                    # (c_soc[~mult_ind] = res_orig[~mult_ind], unchanged)
+
+                    # Solve with the accumulated RHS
                     self.res.get_array()[:] = c_soc
                     self.res.copy_host_to_device()
                     self._update_gradient(self.vars.get_solution())
@@ -2717,6 +2895,7 @@ class Optimizer:
                         self.barrier_param, self.vars, self.px, self.update
                     )
 
+                    # Compute SOC step size and trial point
                     soc_ax, _, soc_az, _ = self.optimizer.compute_max_step(
                         tau, self.vars, self.update
                     )
@@ -2735,12 +2914,6 @@ class Optimizer:
                         soc_accepted = True
                         break
 
-                    # Accumulate: c_soc = alpha_soc * c_soc + c(trial)
-                    self.optimizer.compute_residual(
-                        self.barrier_param, self.temp, self.grad, self.res
-                    )
-                    new_c = self.res.get_array().copy()
-                    c_soc[mult_ind] = alpha_soc * c_soc[mult_ind] + new_c[mult_ind]
                     alpha_soc = soc_ax
 
                 if soc_accepted:
@@ -3119,15 +3292,12 @@ class Optimizer:
                     f"zero-Hessian vars, eps_x_zero={zero_hessian_eps:.2e}"
                 )
 
-        # 5. Quality function barrier strategy setup (if selected)
+        # 5. Adaptive barrier (quality function)
         quality_func = options["barrier_strategy"] == "quality_function"
-        qf_free_mode = True
-        qf_kappa = options["quality_function_kappa_free"]
-        qf_l_max = options["quality_function_l_max"]
-        qf_kkt_history = deque(maxlen=qf_l_max + 1)
-        qf_mu_floor = tol * 0.1  # mu should not go far below convergence tolerance
-        qf_monotone_mu = None
-        qf_M_k_at_entry = None
+        qf_free_mode = True  # start in free (oracle-driven) mode
+        qf_monotone_mu = None  # fixed mu when in monotone mode
+
+        # Norm scaling for quality function (2-norm-squared / element count)
         qf_sd = qf_sp = qf_sc = 1.0
         if quality_func and options["quality_function_norm_scaling"]:
             n_d, n_p, n_c = self.optimizer.get_kkt_element_counts()
@@ -3138,9 +3308,23 @@ class Optimizer:
         self._qf_sp = qf_sp
         self._qf_sc = qf_sc
 
+        # mu bounds
+        qf_mu_min = options["mu_min"]
+        qf_mu_max = -1.0  # computed on first iteration from avg_comp
+        qf_mu_min_default = True  # recompute from tol each iteration
+
+        # Globalization references
+        self._qf_refs = []  # list of reference KKT quality values
+        self._qf_glob_filter = []  # for obj-constr-filter globalization
+        self._qf_init_dual_inf = -1.0
+        self._qf_init_primal_inf = -1.0
+        self._delta_aff = None  # stored affine step
+
         if quality_func:
+            # Seed the KKT reference history with the initial error
             d0, p0, c0 = self.optimizer.compute_kkt_error(self.vars, self.grad)
-            qf_kkt_history.append(d0 * qf_sd + p0 * qf_sp + c0 * qf_sc)
+            init_qf = d0 * qf_sd + p0 * qf_sp + c0 * qf_sc
+            self._qf_refs.append(init_qf)
 
         soc_mult_ind = mult_ind if options["second_order_correction"] else None
 
@@ -3390,239 +3574,260 @@ class Optimizer:
 
             prev_res_norm = res_norm
 
-            # Step D+E: Barrier update + search direction
+            # Step D: Update barrier parameter
+            #   1. quality_function  — adaptive (free/monotone) with oracle
+            #   2. monotone A-3      — reduce when subproblem solved
+            #   3. heuristic         — LOQO-style data-driven
             step_rejected = False
             factorize_ok = True
-            if not filter_ls:
-                if inertia_corrector:
-                    inertia_corrector.update_barrier(self.barrier_param)
-                else:
-                    if i > 0 and max(alpha_x_prev, alpha_z_prev) < 1e-10:
-                        zero_step_count += 1
-                        if zero_step_count >= 3:
-                            old_barrier = self.barrier_param
-                            self.barrier_param = min(self.barrier_param * 10.0, 1.0)
-                            if comm_rank == 0 and self.barrier_param != old_barrier:
-                                print(
-                                    f"  Zero step recovery: barrier {old_barrier:.2e} -> {self.barrier_param:.2e}"
-                                )
-                            zero_step_count = 0
-                    else:
+
+            # Zero-step recovery (only for non-inertia-corrector path)
+            if not inertia_corrector:
+                if i > 0 and max(alpha_x_prev, alpha_z_prev) < 1e-10:
+                    zero_step_count += 1
+                    if zero_step_count >= 3:
+                        old_barrier = self.barrier_param
+                        self.barrier_param = min(self.barrier_param * 10.0, 1.0)
+                        if comm_rank == 0 and self.barrier_param != old_barrier:
+                            print(
+                                f"  Zero step recovery: barrier "
+                                f"{old_barrier:.2e} -> {self.barrier_param:.2e}"
+                            )
                         zero_step_count = 0
+                else:
+                    zero_step_count = 0
 
-            pass
-
-            # Barrier diagonal Sigma (eq. 13).
-            # compute_diagonal writes (not accumulates) each entry.
+            # Barrier diagonal Sigma = Z/S (eq. 13)
             self.optimizer.compute_diagonal(self.vars, self.diag)
             self.diag.copy_device_to_host()
             diag_base = self.diag.get_array().copy()
 
             barrier_before = self.barrier_param
 
-            # Filter LS path: monotone A-3 barrier update.
-            # E_mu = max(||dual||, ||primal||, max_i|s_i*z_i - mu|)
-            # Using max deviation (not avg comp) prevents premature reduction
-            # when individual pairs are far from the central path.
-            if filter_ls:
-                if i > 0 and self.barrier_param > tol:
-                    # Monotone barrier update constants
-                    kappa_eps = 10.0  # barrier_tol_factor
-                    kappa_mu = 0.2  # mu_linear_decrease_factor
-                    theta_mu = 1.5  # mu_superlinear_decrease_power
-                    s_max = 100.0  # scaling threshold
-                    compl_inf_tol = 1e-4  # complementarity tolerance
+            if quality_func:
+                # Adaptive barrier update
 
-                    # Barrier update while-loop
-                    mu_changed = False
-                    while True:
-                        mu = self.barrier_param
-
-                        # E_mu: barrier error
-                        d_inf, p_inf, c_inf = self.optimizer.compute_kkt_error_mu(
-                            mu, self.vars, self.grad
-                        )
-
-                        # Scaling (ComputeOptimalityErrorScaling, line 3663-3700)
-                        # Count only FINITE bounds for dimensions.
-                        zl_arr = np.array(self.vars.get_zl())
-                        zu_arr = np.array(self.vars.get_zu())
-                        lbx = np.array(self.optimizer.get_lbx())
-                        ubx = np.array(self.optimizer.get_ubx())
-                        z_sum = float(np.sum(np.abs(zl_arr)) + np.sum(np.abs(zu_arr)))
-                        n_bounds = int(
-                            np.sum(np.isfinite(lbx)) + np.sum(np.isfinite(ubx))
-                        )
-
-                        # s_c: average bound dual magnitude
-                        if n_bounds == 0:
-                            s_c = 1.0
-                        else:
-                            s_c = max(s_max, z_sum / n_bounds) / s_max
-
-                        # s_d: average of ALL multipliers
-                        xlam = self.vars.get_solution().get_array()
-                        lam_sum = float(
-                            sum(abs(xlam[j]) for j in range(len(xlam)) if mult_ind[j])
-                        )
-                        n_lam = int(np.sum(mult_ind))
-                        n_all = n_lam + n_bounds
-                        if n_all == 0:
-                            s_d = 1.0
-                        else:
-                            s_d = max(s_max, (lam_sum + z_sum) / n_all) / s_max
-
-                        # E_mu = max(dual/s_d, primal, compl/s_c)
-                        # Note: primal is UNSCALED, compl IS scaled
-                        e_mu = max(d_inf / s_d, p_inf, c_inf / s_c)
-
-                        kappa_eps_mu = kappa_eps * mu
-
-                        if e_mu > kappa_eps_mu:
-                            break  # Subproblem not yet solved
-
-                        # Compute new mu and tau
-                        old_mu = mu
-                        new_mu = min(kappa_mu * mu, mu**theta_mu)
-                        mu_floor = min(tol, compl_inf_tol) / (kappa_eps + 1.0)
-                        new_mu = max(new_mu, mu_floor)
-
-                        if new_mu >= old_mu:
-                            break  # Can't reduce further
-
-                        self.barrier_param = new_mu
-                        mu_changed = True
-
-                        # Continue while-loop to check if we can reduce again
-
-                    # Reset filter when mu changed
-                    if mu_changed:
-                        if inertia_corrector:
-                            inertia_corrector.update_barrier(self.barrier_param)
-                        inner_filter.entries.clear()
-                        self._filter_theta_0 = self._compute_filter_theta()
-                factorize_ok = self._find_direction(
-                    x,
-                    diag_base,
-                    inertia_corrector,
-                    mult_ind,
-                    options,
-                    zero_hessian_indices,
-                    zero_hessian_eps,
-                    comm_rank,
-                )
-            elif filter_monotone_mode:
-                if res_norm <= options["barrier_progress_tol"] * filter_monotone_mu:
-                    new_mu = max(
-                        filter_monotone_mu * options["monotone_barrier_fraction"],
-                        tol,
+                # Recompute mu_min each iteration
+                if qf_mu_min_default:
+                    qf_mu_min = min(
+                        options["mu_min"],
+                        0.5 * min(tol, compl_inf_tol),
                     )
-                    if comm_rank == 0:
-                        print(
-                            f"  Filter monotone: mu "
-                            f"{filter_monotone_mu:.2e}->{new_mu:.2e}"
-                        )
-                    filter_monotone_mu = new_mu
-                self.barrier_param = filter_monotone_mu
-                if inertia_corrector:
-                    inertia_corrector.update_barrier(self.barrier_param)
 
-                factorize_ok = self._find_direction(
-                    x,
-                    diag_base,
-                    inertia_corrector,
-                    mult_ind,
-                    options,
-                    zero_hessian_indices,
-                    zero_hessian_eps,
-                    comm_rank,
-                )
-            elif quality_func:
-                factorize_ok = self._factorize_kkt(
-                    x,
-                    diag_base,
-                    inertia_corrector,
-                    mult_ind,
-                    options,
-                    zero_hessian_indices,
-                    zero_hessian_eps,
-                    comm_rank,
-                )
+                # Compute mu_max on first iteration
+                if qf_mu_max < 0:
+                    avg_comp_init, _ = self.optimizer.compute_complementarity(
+                        self.vars
+                    )
+                    qf_mu_max = options["mu_max_fact"] * max(avg_comp_init, 1.0)
+
+                # Record initial infeasibility for safeguard
+                if self._qf_init_dual_inf < 0:
+                    d0_sg, p0_sg, _ = self.optimizer.compute_kkt_error_mu(
+                        0.0, self.vars, self.grad
+                    )
+                    self._qf_init_dual_inf = max(1.0, d0_sg)
+                    self._qf_init_primal_inf = max(1.0, p0_sg)
+
+                # -- Mode switching (before direction computation) --
+                if not qf_free_mode:
+                    # Fixed mode: check if we can return to free mode
+                    sufficient = self._adaptive_mu_check_sufficient_progress(
+                        options
+                    )
+                    if sufficient:
+                        if comm_rank == 0 and options.get("verbose_barrier"):
+                            print("  QF: switching back to free mode")
+                        qf_free_mode = True
+                        self._adaptive_mu_remember_point(options)
+                    else:
+                        # Subproblem solved? → monotone decrease
+                        btf = options["barrier_tol_factor"]
+                        sub_err = self.optimizer.compute_kkt_error_mu(
+                            self.barrier_param, self.vars, self.grad
+                        )
+                        barrier_err = max(sub_err[0], sub_err[1], sub_err[2])
+                        if barrier_err <= btf * self.barrier_param:
+                            old_mu = self.barrier_param
+                            kmu = options["mu_linear_decrease_factor"]
+                            tmu = options["mu_superlinear_decrease_power"]
+                            new_mu = min(kmu * old_mu, old_mu**tmu)
+                            mu_floor = min(tol, compl_inf_tol) / (btf + 1.0)
+                            new_mu = max(new_mu, mu_floor, qf_mu_min)
+                            new_mu = min(new_mu, qf_mu_max)
+                            if comm_rank == 0 and options.get("verbose_barrier"):
+                                print(
+                                    f"  QF monotone: "
+                                    f"{old_mu:.3e} -> {new_mu:.3e}"
+                                )
+                            self.barrier_param = new_mu
+                            qf_monotone_mu = new_mu
 
                 if qf_free_mode:
-                    sigma_opt, mu_qf = self._compute_quality_function_barrier(
-                        tau_min,
-                        use_adaptive_tau,
-                        options,
-                        comm_rank,
+                    # Free mode: check progress, then call oracle
+                    sufficient = self._adaptive_mu_check_sufficient_progress(
+                        options
                     )
-                    self.barrier_param = max(mu_qf, qf_mu_floor)
-                else:
-                    # Monotone mode: fixed mu, decrease when subproblem solved
-                    if res_norm <= options["barrier_progress_tol"] * qf_monotone_mu:
-                        new_mono_mu = max(
-                            qf_monotone_mu * options["monotone_barrier_fraction"],
-                            qf_mu_floor,
+                    glob = options["adaptive_mu_globalization"]
+                    if not sufficient and glob != "never-monotone":
+                        # -> monotone mode
+                        qf_free_mode = False
+                        avg_c, _ = self.optimizer.compute_complementarity(
+                            self.vars
+                        )
+                        new_mu = options["adaptive_mu_monotone_init_factor"] * avg_c
+                        safe = self._adaptive_mu_lower_safeguard(options)
+                        new_mu = max(new_mu, safe, qf_mu_min)
+                        new_mu = min(new_mu, qf_mu_max)
+                        qf_monotone_mu = new_mu
+                        self.barrier_param = new_mu
+                        if comm_rank == 0:
+                            print(
+                                f"  QF -> monotone: mu_bar={new_mu:.3e} "
+                                f"(avg_comp={avg_c:.3e})"
+                            )
+                    else:
+                        if sufficient:
+                            self._adaptive_mu_remember_point(options)
+
+                # -- Factorize KKT system --
+                factorize_ok = self._factorize_kkt(
+                    x, diag_base, inertia_corrector, mult_ind, options,
+                    zero_hessian_indices, zero_hessian_eps, comm_rank,
+                )
+
+                if qf_free_mode and factorize_ok:
+                    # Oracle computes mu AND sets the search direction
+                    result = self._compute_quality_function_mu(
+                        qf_mu_min, qf_mu_max, options, comm_rank
+                    )
+                    if result is not None:
+                        _, mu_qf = result
+                        mu_qf = max(mu_qf, qf_mu_min)
+                        safe = self._adaptive_mu_lower_safeguard(options)
+                        mu_qf = max(mu_qf, safe)
+                        mu_qf = min(mu_qf, qf_mu_max)
+                        self.barrier_param = mu_qf
+                elif not qf_free_mode and factorize_ok:
+                    # Monotone mode: solve with the fixed mu
+                    self._solve_with_mu(self.barrier_param)
+
+            else:
+                # Non-adaptive barrier strategies
+
+                if filter_monotone_mode:
+                    # Filter monotone fallback
+                    if res_norm <= options["barrier_progress_tol"] * filter_monotone_mu:
+                        new_mu = max(
+                            filter_monotone_mu * options["monotone_barrier_fraction"],
+                            tol,
                         )
                         if comm_rank == 0:
                             print(
-                                f"  QF monotone mu: "
-                                f"{qf_monotone_mu:.4e} -> {new_mono_mu:.4e}"
+                                f"  Filter monotone: mu "
+                                f"{filter_monotone_mu:.2e}->{new_mu:.2e}"
                             )
-                        qf_monotone_mu = new_mono_mu
-                    self.barrier_param = qf_monotone_mu
-                if inertia_corrector:
-                    inertia_corrector.update_barrier(self.barrier_param)
+                        filter_monotone_mu = new_mu
+                    self.barrier_param = filter_monotone_mu
 
-                if not qf_free_mode and factorize_ok:
-                    self._solve_with_mu(self.barrier_param)
-            else:
-                heuristic = options["barrier_strategy"] == "heuristic"
-                if heuristic:
-                    complementarity, xi = self.optimizer.compute_complementarity(
-                        self.vars
-                    )
+                elif i > 0 and self.barrier_param > tol:
+                    # Monotone A-3 barrier update
+                    kappa_eps = options["barrier_tol_factor"]
+                    kappa_mu = options["mu_linear_decrease_factor"]
+                    theta_mu = options["mu_superlinear_decrease_power"]
+                    s_max = 100.0
 
-                if options["progress_based_barrier"]:
-                    should_reduce = self._should_reduce_barrier(
-                        res_norm, self.barrier_param, options["barrier_progress_tol"]
-                    )
-                elif heuristic:
-                    should_reduce = True
-                else:
-                    should_reduce = res_norm <= 0.1 * self.barrier_param
-
-                if should_reduce:
+                    heuristic = options["barrier_strategy"] == "heuristic"
                     if heuristic:
-                        self.barrier_param, _ = self._compute_barrier_heuristic(
-                            xi,
-                            complementarity,
-                            options["heuristic_barrier_gamma"],
-                            options["heuristic_barrier_r"],
-                            tol,
+                        comp_h, xi_h = self.optimizer.compute_complementarity(
+                            self.vars
+                        )
+                        should_reduce = True
+                    elif options["progress_based_barrier"]:
+                        should_reduce = self._should_reduce_barrier(
+                            res_norm, self.barrier_param, kappa_eps
                         )
                     else:
-                        kappa_mono = options["monotone_barrier_fraction"]
-                        self.barrier_param = max(
-                            kappa_mono * self.barrier_param,
-                            tol,
-                        )
+                        should_reduce = res_norm <= 0.1 * self.barrier_param
 
-                # Direction finding (regularize, factor, solve)
+                    if should_reduce:
+                        if heuristic:
+                            self.barrier_param, _ = self._compute_barrier_heuristic(
+                                xi_h, comp_h,
+                                options["heuristic_barrier_gamma"],
+                                options["heuristic_barrier_r"],
+                                tol,
+                            )
+                        else:
+                            # A-3 monotone with while-loop for multi-step reduction
+                            while True:
+                                mu = self.barrier_param
+                                d_inf, p_inf, c_inf = (
+                                    self.optimizer.compute_kkt_error_mu(
+                                        mu, self.vars, self.grad
+                                    )
+                                )
+                                # Scaling
+                                zl_a = np.array(self.vars.get_zl())
+                                zu_a = np.array(self.vars.get_zu())
+                                lbx_a = np.array(self.optimizer.get_lbx())
+                                ubx_a = np.array(self.optimizer.get_ubx())
+                                z_sum = float(
+                                    np.sum(np.abs(zl_a)) + np.sum(np.abs(zu_a))
+                                )
+                                n_bnd = int(
+                                    np.sum(np.isfinite(lbx_a))
+                                    + np.sum(np.isfinite(ubx_a))
+                                )
+                                s_c = (
+                                    max(s_max, z_sum / n_bnd) / s_max
+                                    if n_bnd > 0
+                                    else 1.0
+                                )
+                                xlam_a = self.vars.get_solution().get_array()
+                                lam_sum = float(
+                                    sum(
+                                        abs(xlam_a[j])
+                                        for j in range(len(xlam_a))
+                                        if mult_ind[j]
+                                    )
+                                )
+                                n_lam = int(np.sum(mult_ind))
+                                n_all = n_lam + n_bnd
+                                s_d = (
+                                    max(s_max, (lam_sum + z_sum) / n_all) / s_max
+                                    if n_all > 0
+                                    else 1.0
+                                )
+                                e_mu = max(d_inf / s_d, p_inf, c_inf / s_c)
+
+                                if e_mu > kappa_eps * mu:
+                                    break
+                                old_mu = mu
+                                new_mu = min(kappa_mu * mu, mu**theta_mu)
+                                mu_fl = min(tol, compl_inf_tol) / (kappa_eps + 1.0)
+                                new_mu = max(new_mu, mu_fl)
+                                if new_mu >= old_mu:
+                                    break
+                                self.barrier_param = new_mu
+
+                # -- Direction computation (non-QF) --
+                if inertia_corrector:
+                    inertia_corrector.update_barrier(self.barrier_param)
                 factorize_ok = self._find_direction(
-                    x,
-                    diag_base,
-                    inertia_corrector,
-                    mult_ind,
-                    options,
-                    zero_hessian_indices,
-                    zero_hessian_eps,
-                    comm_rank,
+                    x, diag_base, inertia_corrector, mult_ind, options,
+                    zero_hessian_indices, zero_hessian_eps, comm_rank,
                 )
 
-            # Inertia correction failed: skip line search, force rejection.
-            # This matches IPOPT's behavior where SolveOnce returns false
-            # and the step is not taken.
+            # -- Common: reset line search state when mu changed --
+            if self.barrier_param != barrier_before:
+                if inertia_corrector:
+                    inertia_corrector.update_barrier(self.barrier_param)
+                if filter_ls and inner_filter is not None:
+                    inner_filter.entries.clear()
+                    self._filter_theta_0 = self._compute_filter_theta()
+
+            # Inertia correction failed: skip line search, reject step.
             if not factorize_ok:
                 step_rejected = True
                 consecutive_rejections += 1
@@ -3790,20 +3995,22 @@ class Optimizer:
                 self.barrier_param = barrier_before
 
                 if quality_func and qf_free_mode:
-                    comp, _ = self.optimizer.compute_complementarity(self.vars)
-                    qf_monotone_mu_cand = max(0.8 * comp, qf_mu_floor)
-                    M_k = max(qf_kkt_history)
-                    if qf_monotone_mu_cand > qf_mu_floor:
+                    # Step rejection in free mode triggers monotone fallback
+                    if options["adaptive_mu_globalization"] != "never-monotone":
+                        comp, _ = self.optimizer.compute_complementarity(self.vars)
+                        init_factor = options["adaptive_mu_monotone_init_factor"]
+                        qf_monotone_mu_cand = init_factor * comp
+                        safe_mu = self._adaptive_mu_lower_safeguard(options)
+                        qf_monotone_mu_cand = max(qf_monotone_mu_cand, safe_mu, qf_mu_min)
+                        qf_monotone_mu_cand = min(qf_monotone_mu_cand, qf_mu_max)
                         qf_free_mode = False
-                        qf_M_k_at_entry = M_k
                         qf_monotone_mu = qf_monotone_mu_cand
+                        self.barrier_param = qf_monotone_mu
                         if comm_rank == 0:
                             print(
                                 f"  QF -> monotone (step rejected): "
-                                f"mu_bar={qf_monotone_mu:.4e}"
+                                f"mu_bar={qf_monotone_mu:.3e}"
                             )
-                    else:
-                        pass  # comp at floor, skip monotone
 
                 # Handle rejection escape: increase barrier after too many rejections
                 if consecutive_rejections >= max_rejections:
@@ -3834,46 +4041,8 @@ class Optimizer:
 
                 consecutive_rejections = 0
 
-                if quality_func:
-                    dual_sq, primal_sq, comp_sq = self.optimizer.compute_kkt_error(
-                        self.vars, self.grad
-                    )
-                    phi_new = dual_sq * qf_sd + primal_sq * qf_sp + comp_sq * qf_sc
-
-                    M_k = max(qf_kkt_history)
-
-                    if qf_free_mode:
-                        if phi_new > qf_kappa * M_k:
-                            # Failed nonmonotone check -> monotone mode
-                            comp, _ = self.optimizer.compute_complementarity(self.vars)
-                            qf_monotone_mu_cand = max(0.8 * comp, qf_mu_floor)
-                            if qf_monotone_mu_cand > qf_mu_floor:
-                                qf_free_mode = False
-                                qf_M_k_at_entry = M_k
-                                qf_monotone_mu = qf_monotone_mu_cand
-                                if comm_rank == 0:
-                                    print(
-                                        f"  QF -> monotone: "
-                                        f"Phi={phi_new:.4e} > "
-                                        f"kappa*M={qf_kappa * M_k:.4e}"
-                                    )
-                                    print(
-                                        f"  QF monotone: "
-                                        f"mu_bar={qf_monotone_mu:.4e}"
-                                    )
-                            elif comm_rank == 0:
-                                print(
-                                    f"  QF: comp at floor ({comp:.2e}), "
-                                    f"skip monotone"
-                                )
-                        else:
-                            qf_kkt_history.append(phi_new)
-                    else:
-                        if phi_new <= qf_kappa * qf_M_k_at_entry:
-                            qf_kkt_history.append(phi_new)
-                            qf_free_mode = True
-                            qf_monotone_mu = None
-                            qf_M_k_at_entry = None
+                # (QF mode switching is handled at the start of each
+                #  iteration in the barrier update section.)
         if comm_rank == 0 and not opt_data.get("converged", False):
             print(f"\n{'='*70}")
             print(f"  Amigo did NOT converge (max iterations: {max_iters})")
