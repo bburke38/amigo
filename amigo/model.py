@@ -802,19 +802,19 @@ class Model:
     def _get_expr_type(self, name: str):
         path, indices = _parse_var_expr(name)
         comp_name = ".".join(path[:-1])
-        name = path[-1]
+        var_name = path[-1]
 
-        if name in self.comp[comp_name].get_input_names():
+        if var_name in self.comp[comp_name].get_input_names():
             return "input"
-        elif name in self.comp[comp_name].get_constraint_names():
+        elif var_name in self.comp[comp_name].get_constraint_names():
             return "constraint"
-        elif name in self.comp[comp_name].get_data_names():
+        elif var_name in self.comp[comp_name].get_data_names():
             return "data"
-        elif name in self.comp[comp_name].get_output_names():
+        elif var_name in self.comp[comp_name].get_output_names():
             return "output"
         else:
             raise ValueError(
-                f"Name {comp_name}.{name} is neither an input, constraint, output or data"
+                f"Name {comp_name}.{var_name} is neither an input, constraint, output or data"
             )
 
     def get_indices(self, name: str | List[str]):

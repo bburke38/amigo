@@ -90,7 +90,7 @@ data_space = basis.SolutionSpace({"Jz": "const"})
 geo_space = basis.SolutionSpace({"x": "H1", "y": "H1"})
 
 # Define the global amigo model
-main = am.Model("main")
+model = am.Model("multi_mesh_model")
 
 # Create an amigo model for each mesh
 for mesh_name, mesh in meshes.items():
@@ -102,14 +102,15 @@ for mesh_name, mesh in meshes.items():
         integrand_map=integrand_map[mesh_name],
         bc_map=bc_map[mesh_name],
     )
-    model = problem.create_model(mesh_name)
-    main.add_model(mesh_name, model)
+    sub_model = problem.create_model(mesh_name)
+    model.add_model(mesh_name, sub_model)
+
 
 # Extract the shared edge between the meshes
 mesh0 = meshes["Mesh0"]
 mesh1 = meshes["Mesh1"]
-nodes_line_1 = mesh0.get_bc_nodes("LINE1", "T3D2")
-nodes_line_3 = mesh1.get_bc_nodes("LINE3", "T3D2")
+nodes_line_1 = mesh0.get_nodes_in_domain("LINE1")
+nodes_line_3 = mesh1.get_nodes_in_domain("LINE3")
 nodes_line_3 = np.flip(nodes_line_3)
 
 # Know number of points along shared edge
@@ -125,46 +126,48 @@ nodes_line_1_shared = nodes_line_1[slide_number:]
 nodes_line_3_shared = (
     nodes_line_3[:] if slide_number == 0 else nodes_line_3[0:-slide_number]
 )
-for i in range(len(nodes_line_1_shared)):
-    main.link(
-        f"Mesh0.soln.u[{nodes_line_1_shared[i]}]",
-        f"Mesh1.soln.u[{nodes_line_3_shared[i]}]",
-    )
+model.link(
+    "Mesh0.soln.u",
+    "Mesh1.soln.u",
+    src_indices=nodes_line_1_shared,
+    tgt_indices=nodes_line_3_shared,
+)
+
 
 # BCs for the hanging edges
 nodes_line_1_hanging = (
     nodes_line_1[:] if slide_number == 0 else nodes_line_1[0:slide_number]
 )
 nodes_line_3_hanging = nodes_line_3[-slide_number:]
-for i in range(len(nodes_line_1_hanging)):
-    main.link(
-        f"Mesh0.soln.u[{nodes_line_1_hanging[i]}]",
-        f"Mesh1.soln.u[{nodes_line_3_hanging[i]}]",
-    )
-
+model.link(
+    "Mesh0.soln.u",
+    "Mesh1.soln.u",
+    src_indices=nodes_line_1_hanging,
+    tgt_indices=nodes_line_3_hanging,
+)
 
 # Build the model
 if args.build:
-    main.build_module()
+    model.build_module()
 
-main.initialize()
+model.initialize()
 
 # Set the problem data
-data = main.get_data_vector()
-data["Mesh0.data.Jz[0]"] = 0.0  # SURFACE1
-data["Mesh0.data.Jz[1]"] = 10.0  # SURFACE2
-data["Mesh0.data.Jz[2]"] = 10.0  # SURFACE3
+data = model.get_data_vector()
+data["Mesh0.data.Jz.SURFACE1"] = 0.0
+data["Mesh0.data.Jz.SURFACE2"] = 10.0
+data["Mesh0.data.Jz.SURFACE3"] = 10.0
 
-data["Mesh1.data.Jz[0]"] = 0.0  # SURFACE1
-data["Mesh1.data.Jz[1]"] = 10.0  # SURFACE2
-data["Mesh1.data.Jz[2]"] = 10.0  # SURFACE3
+data["Mesh1.data.Jz.SURFACE1"] = 0.0  # SURFACE1
+data["Mesh1.data.Jz.SURFACE2"] = 10.0  # SURFACE2
+data["Mesh1.data.Jz.SURFACE3"] = 10.0  # SURFACE3
 
-x = main.create_vector()
-g = main.create_vector()
-mat = main.create_matrix()
+x = model.create_vector()
+g = model.create_vector()
+mat = model.create_matrix()
 
-main.eval_gradient(x, g)
-main.eval_hessian(x, mat)
+model.eval_gradient(x, g)
+model.eval_hessian(x, mat)
 
 csr_mat = am.tocsr(mat)
 

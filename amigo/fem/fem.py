@@ -3,10 +3,8 @@ import numpy as np
 from . import basis
 from .connectivity import InpParser
 from .element import FiniteElement, FiniteElementOutput
-
-import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
-from matplotlib.collections import PolyCollection
+from .plot_utils import plot
+from pathlib import Path
 
 
 class DofSource(am.Component):
@@ -77,7 +75,7 @@ class BoundaryConditions:
     def _get_bc_nodes(self, targets, start=True, end=True):
         all_nodes = []
         for target in targets:
-            nodes = self.mesh.get_bc_nodes(target, "T3D2")
+            nodes = self.mesh.get_nodes_in_domain(target)
             all_nodes.extend(nodes)
 
         unique = list(dict.fromkeys(all_nodes))
@@ -128,8 +126,8 @@ class BoundaryConditions:
 
         else:
             targets = self.bc["target"]
-            start = self.bc["start"] if "start" in self.bc else True
-            end = self.bc["end"] if "end" in self.bc else True
+            start = self.bc.get("start", True)
+            end = self.bc.get("end", True)
 
             nodes_left, nodes_right = self._get_matched_nodes(
                 targets, start=start, end=end
@@ -183,69 +181,93 @@ class DegreesOfFreedom:
 
         return
 
-    def add_source(self, model):
-        # Get the names of things associated with H1
+    def _add_h1_source(self, model):
+        names = self.space.get_names("H1")
+        if len(names) == 0:
+            return
 
-        for sp in ["H1", "const"]:
-            names = self.space.get_names(sp)
+        input_names, data_names, con_names = [], [], []
+        if self.kind == "input":
+            input_names = names
+        elif self.kind == "data":
+            data_names = names
+        elif self.kind == "multiplier":
+            con_names = [f"res_{name}" for name in names]
 
-            if len(names) == 0:
-                continue
+        # Create the source component
+        dof_src = DofSource(
+            input_names=input_names, con_names=con_names, data_names=data_names
+        )
 
-            # Create amigo source component with input names and geo names
-            input_names = []
-            data_names = []
-            con_names = []
+        # Add global mesh source component
+        nnodes = self.mesh.get_num_nodes()
+        model.add_component(self.name, nnodes, dof_src)
+
+        return
+
+    def _link_h1(self, model, domain, etype, elem_name):
+        names = self.space.get_names("H1")
+        if len(names) == 0:
+            return
+
+        if self.kind == "multiplier":
+            con_names = [f"res_{name}" for name in names]
+            names = con_names
+
+        conn = self.mesh.get_conn(domain, etype)
+        for name in names:
+            model.link(
+                f"{self.name}.{name}",
+                f"{elem_name}.{name}",
+                src_indices=conn,
+            )
+
+        return name
+
+    def _link_const(self, model, domain, elem_name):
+        for name in self.space.get_names("const"):
+            model.link(
+                f"{self.name}.{name}.{domain}",
+                f"{elem_name}.{name}[:]",
+            )
+
+    def _add_const_source(self, model):
+        names = self.space.get_names("const")
+        if len(names) == 0:
+            return
+
+        # Create a sub-model for each data set
+        sub_model = am.Model()
+        for data_name in names:
+
+            domains = self.mesh.get_domains()
+
+            domain_names = [name for name in domains]
+            input_names, data_names, con_names = [], [], []
             if self.kind == "input":
-                input_names = names
+                input_names = domain_names
             elif self.kind == "data":
-                data_names = names
+                data_names = domain_names
             elif self.kind == "multiplier":
-                con_names = [f"res_{name}" for name in names]
+                con_names = [f"res_{name}" for name in domain_names]
 
             dof_src = DofSource(
                 input_names=input_names, con_names=con_names, data_names=data_names
             )
+            sub_model.add_component(data_name, 1, dof_src)
 
-            # Add global mesh source component
-            if sp == "H1":
-                nnodes = self.mesh.get_num_nodes()
-                model.add_component(f"{self.name}", nnodes, dof_src)
+        model.add_model(self.name, sub_model)
 
-            elif sp == "const":
-                nsurfaces = self.mesh.get_num_surfaces()
-                model.add_component(f"{self.name}", nsurfaces, dof_src)
+        return
+
+    def add_source(self, model):
+        self._add_h1_source(model)
+        self._add_const_source(model)
+        return
 
     def link_dof(self, model, domain, etype, elem_name):
-        for sp in ["H1", "const"]:
-            names = self.space.get_names(sp)
-
-            if self.kind == "multiplier":
-                con_names = [f"res_{name}" for name in names]
-                names = con_names
-
-            if len(names) == 0:
-                continue
-
-            if sp == "H1":
-                conn = self.mesh.get_conn(domain, etype)
-                for name in names:
-                    model.link(
-                        f"{self.name}.{name}",
-                        f"{elem_name}.{name}",
-                        src_indices=conn,
-                    )
-
-            elif sp == "const":
-                gmsh_surf_index = int(domain.replace("SURFACE", ""))
-                surf_index = gmsh_surf_index - 1
-
-                for name in names:
-                    model.link(
-                        f"{self.name}.{name}[{surf_index}]",
-                        f"{elem_name}.{name}[:]",
-                    )
-
+        self._link_h1(model, domain, etype, elem_name)
+        self._link_const(model, domain, elem_name)
         return
 
     def get_basis(self, etype):
@@ -256,9 +278,13 @@ class DegreesOfFreedom:
 
 
 class Mesh:
-    def __init__(self, filename):
-        self.parser = InpParser()
-        self.parser.parse_inp(filename)
+    def __init__(self, filename: str):
+        ext = Path(filename).suffix
+        if ext == ".inp" or ext == ".INP":
+            self.parser = InpParser()
+            self.parser.parse_inp(filename)
+        else:
+            raise ValueError(f"Unrecognized file extension {ext}")
 
         self.X = self.parser.get_nodes()
 
@@ -266,269 +292,44 @@ class Mesh:
         return self.X.shape[0]
 
     def get_domains(self):
-        domains = self.parser.get_domains()
-        element_types = ["CPS3", "CPS4", "CPS6", "M3D9", "T3D2"]
-
-        volumes = {}
-        for name in domains:
-            for etype in element_types:
-                if etype in domains[name]:
-                    volumes[name] = domains[name]
-                    break
-
-        return volumes
+        """
+        Get a dictionary of the element types for each domain, indexed by the name
+        of each domain
+        """
+        return self.parser.get_domains()
 
     def get_conn(self, name, etype):
+        """
+        Get the connectivity for the given domain name with the given element type
+        """
         return self.parser.get_conn(name, etype)
+
+    def get_basis(self, space, etype, kind):
+        """
+        Get an instance of a Basis class that is matched to the solution space, element
+        type and kind of quantity
+        """
+        return self.parser.get_basis(space, etype, kind=kind)
+
+    def get_quadrature(self, etype):
+        """
+        Get an instance of Quadrature that is matched to the element type
+        """
+        return self.parser.get_quadrature(etype)
+
+    def get_nodes_in_domain(self, name, etype=None):
+        """
+        Get nodes in the specified domain for all element types (if etype == None),
+        or a specific element type.
+        """
+        return self.parser.get_nodes_in_domain(name)
 
     def get_num_elements(self, name, etype):
         return self.parser.get_conn(name, etype).shape[0]
 
-    def get_num_surfaces(self):
-        return self.parser.get_num_surfaces()
-
-    def get_bc_nodes(self, name, etype):
-        conn = self.parser.get_edge_node(name, etype)
-        return conn
-
-    def get_num_nodes_on_bc(self, name, etype):
-        return self.parser.get_edge_node(name, etype).shape[0]
-
-    def get_basis(self, space, etype, kind):
-        return self.parser.get_basis(space, etype, kind=kind)
-
-    def get_quadrature(self, etype):
-        return self.parser.get_quadrature(etype)
-
-    def plot(
-        self,
-        u,
-        fig=None,
-        ax=None,
-        nlevels=30,
-        cmap="coolwarm",
-        title=None,
-        x_offset=0.0,
-        y_offset=0.0,
-        min_level=None,
-        max_level=None,
-    ):
-        if min_level == None or max_level == None:
-            min_level = np.min(u)
-            max_level = np.max(u)
-
-        levels = np.linspace(min_level, max_level, nlevels)
-
-        if ax is None:
-            fig, ax = plt.subplots(nrows=1, ncols=1, figsize=(8, 6))
-
-        volumes = self.get_domains()
-        x = self.X[:, 0] + x_offset
-        y = self.X[:, 1] + y_offset
-
-        for name in volumes:
-            for etype in volumes[name]:
-                if etype == "T3D2":
-                    """do not attempt to plot when line element found"""
-                    continue
-                # Get the connectivity
-                conn = self.convert_conn(etype, self.get_conn(name, etype))
-                tri = mtri.Triangulation(x, y, conn)
-
-                # Set the contour plot
-                cntr = ax.tricontourf(tri, u, levels=levels, cmap=cmap)
-                ax.tricontour(
-                    tri, u, levels=levels, colors="k", linewidths=0.3, alpha=0.5
-                )
-
-                # Overlay the mesh skeleton
-                gmsh_conn = self.get_conn(name, etype)
-                X2d = self.X[:, 0:2]
-                polygons = [X2d[row] for row in gmsh_conn]
-                mesh = PolyCollection(
-                    polygons,
-                    facecolor="none",
-                    edgecolor="black",
-                    linewidth=0.5,
-                    alpha=0.4,
-                )
-                # ax.add_collection(mesh)
-
-                if title is not None:
-                    ax.set_title(title)
-
-                ax.set_aspect("equal")
-                # fig.colorbar(cntr, ax=ax)
-        return ax
-
-    def plot_3d(
-        self,
-        w,
-        fig=None,
-        ax=None,
-        scale=1.0,
-        cmap="coolwarm",
-        title=None,
-        x_offset=0.0,
-        y_offset=0.0,
-        alpha=0.85,
-        show_edges=True,
-        min_level=None,
-        max_level=None,
-    ):
-        """
-        Plot the 2D mesh lifted into 3D by the out-of-plane displacement field w.
-
-        Parameters
-        ----------
-        w         : (nnodes,) array — perpendicular displacement at each node
-        fig/ax    : existing Figure / Axes3D to draw into (created if None)
-        scale     : multiply w before plotting (useful for visual exaggeration)
-        cmap      : matplotlib colormap name
-        title     : axes title string
-        x_offset  : shift all x coordinates before plotting
-        y_offset  : shift all y coordinates before plotting
-        alpha     : surface transparency
-        show_edges: overlay mesh wire-frame on the surface
-        min_level / max_level : clamp the colormap range
-        """
-        from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 — registers 3d projection
-        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-        import matplotlib.cm as cm
-        import matplotlib.colors as mcolors
-
-        if fig is None or ax is None:
-            fig = plt.figure(figsize=(10, 7))
-            ax = fig.add_subplot(111, projection="3d")
-
-        x = self.X[:, 0] + x_offset
-        y = self.X[:, 1] + y_offset
-        z = np.asarray(w) * scale
-
-        # Colormap normalisation
-        vmin = np.min(z) if min_level is None else min_level * scale
-        vmax = np.max(z) if max_level is None else max_level * scale
-        norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
-        scalar_map = cm.ScalarMappable(norm=norm, cmap=cmap)
-
-        volumes = self.get_domains()
-
-        for name in volumes:
-            for etype in volumes[name]:
-                if etype == "T3D2":
-                    continue
-
-                # Triangulate so we can colour per-triangle face
-                tri_conn = self.convert_conn(etype, self.get_conn(name, etype))
-
-                verts = []
-                face_colors = []
-                for tri in tri_conn:
-                    pts = np.column_stack([x[tri], y[tri], z[tri]])  # (3, 3)
-                    verts.append(pts)
-                    # colour by mean displacement of the triangle
-                    face_colors.append(scalar_map.to_rgba(np.mean(z[tri])))
-
-                poly = Poly3DCollection(
-                    verts,
-                    facecolors=face_colors,
-                    edgecolors="k" if show_edges else "none",
-                    linewidths=0.3 if show_edges else 0.0,
-                    alpha=alpha,
-                )
-                ax.add_collection3d(poly)
-
-        # Axis limits derived from data
-        ax.set_xlim(x.min(), x.max())
-        ax.set_ylim(y.min(), y.max())
-        ax.set_zlim(vmin, vmax)
-
-        ax.set_xlabel("X")
-        ax.set_ylabel("Y")
-        ax.set_zlabel("w")
-
-        if title is not None:
-            ax.set_title(title)
-
-        fig.colorbar(scalar_map, ax=ax, shrink=0.5, label="w")
-
-        return ax
-
-    def convert_conn(self, etype, conn):
-        if etype == "CPS3":
-            return conn
-        elif etype == "CPS4":
-            c = [[0, 1, 2], [0, 2, 3]]
-        elif etype == "CPS6":
-            # 2
-            # |  .
-            # 5     4
-            # |        .
-            # 0 --- 3 --- 1
-            c = [[0, 3, 5], [3, 4, 5], [3, 1, 4], [5, 4, 2]]
-        elif etype == "M3D9":
-            # 3 --- 6 --- 2
-            # |           |
-            # 7     8     5
-            # |           |
-            # 0 --- 4 --- 1
-            c = [
-                [0, 4, 7],
-                [4, 8, 7],
-                [4, 1, 8],
-                [1, 5, 8],
-                [7, 8, 3],
-                [8, 6, 3],
-                [8, 5, 6],
-                [5, 2, 6],
-            ]
-
-        cs = []
-        for c0 in c:
-            cs.append(conn[:, c0])
-
-        return np.vstack(cs)
-
-    def plot_tri_mesh_region(self, name, etype, ax, color, label):
-        X2d = self.X[:, 0:2]  # Reduce to 2d (x,y coords only)
-        gmsh_conn = self.get_conn(name, etype)
-        polygons = [X2d[row] for row in gmsh_conn]
-
-        coll = PolyCollection(
-            polygons,
-            facecolors=color,
-            edgecolors="k",
-            linewidths=0.01,
-            label=label,
-            antialiaseds=False,
-        )
-        ax.add_collection(coll)
-        return
-
-    def plot_edge(
-        self,
-        name,
-        etype,
-        ax,
-        color,
-        label,
-        flip=False,
-        start=True,
-        end=True,
-    ):
-        X2d = self.X[:, 0:2]  # Reduce to 2d (x,y coords only)
-
-        nodes = self.get_bc_nodes(name, etype, flip)
-        # if start == False and end == False:
-        #     nodes = nodes[1:-1]
-        # elif start == True and end == False:
-        #     nodes = nodes[:-1]
-        # elif start == False and end == True:
-        #     nodes = nodes[1:]
-
-        ax.plot(X2d[nodes, 0], X2d[nodes, 1], color=color, label=label, linewidth=2.0)
-
-        return
+    def plot(self, u, **kwargs):
+        """Plot the finite element solution on the mesh"""
+        plot(self, u, **kwargs)
 
 
 class Problem:
