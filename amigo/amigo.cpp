@@ -540,9 +540,9 @@ PYBIND11_MODULE(amigo, mod) {
 
   py::class_<amigo::SparseLDL<double>,
              std::shared_ptr<amigo::SparseLDL<double>>>(mod, "SparseLDL")
-      .def(py::init<std::shared_ptr<amigo::CSRMat<double>>>());
-  //  .def("factor", &amigo::SparseLDL<double>::factor)
-  //  .def("solve", &amigo::SparseLDL<double>::solve);
+      .def(py::init<std::shared_ptr<amigo::CSRMat<double>>>())
+      .def("factor", &amigo::SparseLDL<double>::factor)
+      .def("solve", &amigo::SparseLDL<double>::solve);
 
 #ifdef AMIGO_USE_CUDA
   py::class_<amigo::CSRMatFactorCuda, std::shared_ptr<amigo::CSRMatFactorCuda>>(

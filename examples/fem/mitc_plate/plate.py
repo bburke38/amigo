@@ -3,6 +3,7 @@ import amigo as am
 from amigo.fem import MITCTyingStrain, MITCElement, SolutionSpace, Mesh, Problem
 from scipy.sparse.linalg import spsolve
 import matplotlib.pyplot as plt
+import time
 
 
 class MITC4PlateTying(MITCTyingStrain):
@@ -88,6 +89,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument(
     "--build", dest="build", action="store_true", default=False, help="Enable building"
 )
+parser.add_argument(
+    "--solver", dest="solver", choices=["cholesky", "ldl", "scipy"], default="cholesky"
+)
 args = parser.parse_args()
 
 # Create the solution spaces
@@ -145,6 +149,8 @@ if args.build:
 
 model.initialize()
 
+print("Number of variables... ", model.num_variables)
+
 # Create the vectors and matrices for the model
 x = model.create_vector()
 g = model.create_vector()
@@ -157,20 +163,25 @@ model.eval_hessian(x, mat)
 # Solve the equations
 print("Solving...")
 
-csr = am.tocsr(mat)
-print(csr.shape)
+start_time = time.perf_counter()
+if args.solver == "cholesky":
+    chol = am.SparseCholesky(mat)
+    chol.factor()
 
-# chol = am.SparseCholesky(mat)
+    x[:] = g[:]
+    chol.solve(x.get_vector())
+elif args.solver == "ldl":
+    ldl = am.SparseLDL(mat)
+    ldl.factor()
 
-# ldl = am.SparseLDL(mat)
+    x[:] = g[:]
+    ldl.solve(x.get_vector())
+elif args.solver == "scipy":
+    csr = am.tocsr(mat)
+    x[:] = spsolve(csr, g[:])
 
-# flag = chol.factor()
-
-# Solve the equations
-# x[:] = g[:]
-# chol.solve(x.get_vector())
-
-x[:] = spsolve(csr, g[:])
+end_time = time.perf_counter()
+print(f"Solve time... {end_time - start_time:.6f} seconds")
 
 print("Plotting...")
 w = x["soln.w"]

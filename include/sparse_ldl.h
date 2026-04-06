@@ -6,6 +6,20 @@
 
 namespace amigo {
 
+// Quick lapack stuff
+extern "C" {
+void dpotrf_(const char* uplo, const int* n, double* a, const int* lda,
+             int* info);
+
+void dtrsm_(const char* side, const char* uplo, const char* transa,
+            const char* diag, const int* m, const int* n, const double* alpha,
+            const double* A, const int* lda, double* B, const int* ldb);
+
+void dtrtrs_(const char* uplo, const char* trans, const char* diag,
+             const int* n, const int* nrhs, const double* A, const int* lda,
+             double* B, const int* ldb, int* info);
+}
+
 template <typename T>
 class SparseLDL {
  public:
@@ -56,7 +70,10 @@ class SparseLDL {
    */
   void solve(Vector<T>* xvec) {
     T* x = xvec->get_array();
-    T* temp = nullptr;
+
+    int max_pivots = fact.get_max_pivots();
+    int max_delayed = fact.get_max_delayed();
+    T* temp = new T[max_pivots + max_delayed + max_contrib];
 
     int ns = 0;
     for (int ks = 0; ks < num_snodes; ks++) {
@@ -64,22 +81,40 @@ class SparseLDL {
       int num_pivots, num_delayed;
       const int* pivots = nullptr;
       const int* delayed = nullptr;
-      const T *L11, *L21;
-      fact.get_factor(ks, &num_pivots, &pivots, &num_delayed, &delayed, &L11,
-                      &L21);
+      const T* L;
+      fact.get_factor(ks, &num_pivots, &pivots, &num_delayed, &delayed, &L);
+      int num_contrib = contrib_ptr[ks + 1] - contrib_ptr[ks];
+      int ldl = num_pivots + num_delayed + num_contrib;
 
       // Extract the variables from x
-      int jj = 0;
-      for (int j = 0; j < num_pivots; j++, jj++) {
-        temp[jj] = x[pivots[j]];
+      for (int j = 0; j < num_pivots; j++) {
+        temp[j] = x[pivots[j]];
       }
 
-      // Add the contributions to the stuf
-      for (int j = 0; j < num_delayed; j++, jj++) {
-        temp[jj] = x[delayed[j]];
+      int nrhs = 1;
+      int info = 0;
+      dtrtrs_("L", "N", "N", &num_pivots, &nrhs, L, &ldl, temp, &num_pivots,
+              &info);
+
+      // Assign the entries back
+      for (int j = 0; j < num_pivots; j++) {
+        x[pivots[j]] = temp[j];
       }
-      for (int jp = contrib_ptr[ks]; jp < contrib_ptr[ks + 1]; jp++, jj++) {
-        temp[jj] = x[contrib_rows[jp]];
+
+      // Compute the matrix-vector product
+      int size = num_delayed + num_contrib;
+      T alpha = 1.0, beta = 0.0;
+      int inc = 1;
+      blas_gemv<T>("N", &size, &num_pivots, &alpha, &L[num_pivots], &ldl, temp,
+                   &inc, &beta, &temp[num_pivots], &inc);
+
+      // Add the contributions
+      for (int j = 0, jj = num_pivots; j < num_delayed; j++, jj++) {
+        x[delayed[j]] -= temp[jj];
+      }
+      for (int jp = contrib_ptr[ks], jj = num_pivots + num_delayed;
+           jp < contrib_ptr[ks + 1]; jp++, jj++) {
+        x[contrib_rows[jp]] -= temp[jj];
       }
     }
 
@@ -88,24 +123,54 @@ class SparseLDL {
       int num_pivots, num_delayed;
       const int* pivots = nullptr;
       const int* delayed = nullptr;
-      const T *L11, *L21;
-      fact.get_factor(ks, &num_pivots, &num_delayed, &pivots, &delayed, &L11,
-                      &L21);
+      const T* L;
+      fact.get_factor(ks, &num_pivots, &pivots, &num_delayed, &delayed, &L);
+      int num_contrib = contrib_ptr[ks + 1] - contrib_ptr[ks];
+      int ldl = num_pivots + num_delayed + num_contrib;
 
       // Extract the variables from x
-      int jj = 0;
-      for (int j = 0; j < num_pivots; j++, jj++) {
-        temp[jj] = x[pivots[j]];
+      for (int j = 0; j < num_pivots; j++) {
+        temp[j] = x[pivots[j]];
       }
 
-      // Add the contributions to the stuf
-      for (int j = 0; j < num_delayed; j++, jj++) {
+      // Collect the values from the contributions
+      for (int j = 0, jj = num_pivots; j < num_delayed; j++, jj++) {
         temp[jj] = x[delayed[j]];
       }
-      for (int jp = contrib_ptr[ks]; jp < contrib_ptr[ks + 1]; jp++, jj++) {
+      for (int jp = contrib_ptr[ks], jj = num_pivots + num_delayed;
+           jp < contrib_ptr[ks + 1]; jp++, jj++) {
         temp[jj] = x[contrib_rows[jp]];
       }
+
+      // Compute the matrix-vector product
+      int size = num_delayed + num_contrib;
+      T alpha = -1.0, beta = 1.0;
+      int inc = 1;
+      blas_gemv<T>("T", &size, &num_pivots, &alpha, &L[num_pivots], &ldl,
+                   &temp[num_pivots], &inc, &beta, temp, &inc);
+
+      // Right-hand-side is ready
+      int nrhs = 1;
+      int info = 0;
+      dtrtrs_("L", "T", "N", &num_pivots, &nrhs, L, &ldl, temp, &num_pivots,
+              &info);
+
+      // Assign the entries back
+      for (int j = 0; j < num_pivots; j++) {
+        x[pivots[j]] = temp[j];
+      }
     }
+  }
+
+  /**
+   * @brief Get the inertia of the matrix based on the factorization
+   *
+   * @param npos Number of positive eigenvalues
+   * @param nneg Number of negative eigenvalues
+   */
+  void get_inertia(int* npos, int* nneg) {
+    *npos = 0;
+    *nneg = 0;
   }
 
  private:
@@ -171,12 +236,12 @@ class SparseLDL {
      * C is size (front_size - num_pivots)
      *
      * @param num_pivots Number of columns selected as pivots
-     * @param delayed_pivots Number of delayed pivots
+     * @param num_delayed_pivots Number of delayed pivots
      * @param front_size Size of the front matrix F
      * @param vars Variables on the front matrix
      * @param F The front matrix values
      */
-    void push(int num_pivots, int delayed_pivots, int front_size,
+    void push(int num_pivots, int num_delayed_pivots, int front_size,
               const int vars[], const T F[]) {
       // Copy the indices first
       int contrib_size = front_size - num_pivots;
@@ -184,7 +249,7 @@ class SparseLDL {
       top_idx += contrib_size;
 
       // Save the delayed pivots and size of the contribution block
-      idx[top_idx] = delayed_pivots;
+      idx[top_idx] = num_delayed_pivots;
       idx[top_idx + 1] = contrib_size;
       top_idx += 2;
 
@@ -204,7 +269,8 @@ class SparseLDL {
      * @param vars Indices for the contribution block
      * @param C The contribution block values
      */
-    void pop(int* delayed_pivots, int* contrib_size, int* vars[], T* C[]) {
+    void pop(int* delayed_pivots, int* contrib_size, const int* vars[],
+             const T* C[]) {
       *delayed_pivots = idx[top_idx - 2];
       int cb_size = idx[top_idx - 1];
       *contrib_size = cb_size;
@@ -222,28 +288,140 @@ class SparseLDL {
     T* work;       // Entries in the matrix
   };
 
+  /**
+   * @brief Store the factored contributions from the matrix
+   */
   class MatrixFactor {
    public:
-    MatrixFactor() {}
-    ~MatrixFactor() {}
+    MatrixFactor() {
+      ncols = 0;
+      num_snodes = 0;
+      max_pivots = 0;
+      max_delayed = 0;
+    }
 
-    void allocate(int ncols, int num_snodes, int factor_nnz) {}
+    /**
+     * @brief Allocate the space for the factored matrix
+     *
+     * @param num_cols
+     * @param num_super_nodes
+     * @param factor_nnz
+     */
+    void allocate(int num_cols, int num_super_nodes, int factor_nnz) {
+      ncols = num_cols;
+      num_snodes = num_super_nodes;
+      max_pivots = 0;
+      max_delayed = 0;
 
-    void reset() {}
+      meta.assign(num_snodes, NodeMeta{});
 
+      int_data.clear();
+      factor_data.clear();
+
+      // Optional preallocation
+      int_data.reserve(factor_nnz);
+      factor_data.reserve(factor_nnz);
+    }
+
+    /**
+     * @brief Add contributions from the factors
+     *
+     * @param ks The supernode index
+     * @param num_pivots The number of pivots for this node
+     * @param pivots The pivot variable numbers
+     * @param num_delayed The number of delayed pivots
+     * @param delayed The delayed pivot indices
+     * @param contrib_size The contribution block size
+     * @param L The factor entries
+     */
     void add_factor(int ks, int num_pivots, const int pivots[], int num_delayed,
-                    const int delayed[], int contrib_size, const T L[]) {}
+                    const int delayed[], int contrib_size, const T L[]) {
+      const int nrows = num_pivots + num_delayed + contrib_size;
+      const int block_size = nrows * num_pivots;
 
+      NodeMeta& m = meta[ks];
+      m.num_pivots = num_pivots;
+      m.num_delayed = num_delayed;
+
+      if (num_delayed > max_delayed) {
+        max_delayed = num_delayed;
+      }
+      if (num_pivots > max_pivots) {
+        max_pivots = num_pivots;
+      }
+
+      m.pivot_offset = static_cast<int>(int_data.size());
+      int_data.insert(int_data.end(), pivots, pivots + num_pivots);
+
+      m.delayed_offset = static_cast<int>(int_data.size());
+      int_data.insert(int_data.end(), delayed, delayed + num_delayed);
+
+      m.L_offset = static_cast<int>(factor_data.size());
+      factor_data.insert(factor_data.end(), L, L + block_size);
+    }
+
+    /**
+     * @brief Get the factor for the specified super node
+     *
+     * @param ks The supernode index
+     * @param num_pivots The number of pivots for this node
+     * @param pivots The pivot variable numbers
+     * @param num_delayed The number of delayed pivots
+     * @param delayed The delayed pivot indices
+     * @param L The factor entries
+     */
     void get_factor(int ks, int* num_pivots, const int* pivots[],
-                    int* num_delayed, const int* delayed[], const T* L11,
-                    const T* L21);
+                    int* num_delayed, const int* delayed[],
+                    const T* L[]) const {
+      const NodeMeta& m = meta[ks];
+      if (num_pivots) {
+        *num_pivots = m.num_pivots;
+      }
+      if (pivots) {
+        *pivots = &int_data[m.pivot_offset];
+      }
+      if (num_delayed) {
+        *num_delayed = m.num_delayed;
+      }
+      if (delayed) {
+        *delayed = &int_data[m.delayed_offset];
+      }
+      if (L) {
+        *L = &factor_data[m.L_offset];
+      }
+    }
+
+    /**
+     * @brief Get the max pivots for any super node
+     *
+     * @return int
+     */
+    int get_max_pivots() const { return max_pivots; }
+
+    /**
+     * @brief Get the max delayed pivots for any super node
+     *
+     * @return int
+     */
+    int get_max_delayed() const { return max_delayed; }
 
    private:
-    // int num_snodes;
-    // int num_pivots;
+    struct NodeMeta {
+      int num_pivots;
+      int num_delayed;
+      int pivot_offset;
+      int delayed_offset;
+      int L_offset;
+    };
 
-    // int* pivots;
-    // int* ptr;
+    int ncols;
+    int num_snodes;
+    int max_pivots;
+    int max_delayed;
+
+    std::vector<NodeMeta> meta;
+    std::vector<int> int_data;   // pivots and delayed indices
+    std::vector<T> factor_data;  // all L blocks
   };
 
   /**
@@ -269,16 +447,19 @@ class SparseLDL {
     int* front_vars = &temp[ncols];  // Variables in the front
 
     // TODO: Compute proper size for the frontal matrix
-    int max_frontal_size = 10 * cholesky_nnz;
+    int max_frontal_size = 2 * cholesky_nnz + ncols;
     T* F = new T[max_frontal_size];
 
     // TODO: Compute proper sizes for the stack
-    int size = 10 * cholesky_nnz;
+    int size = 2 * cholesky_nnz + ncols;
     ContributionStack stack(size, size);
 
-    for (int ks = 0, k = 0; ks < num_snodes; k += snode_size[ks], ks++) {
+    // Info flag
+    int info = 0;
+    int ns = 0;
+    for (int ks = 0, k = 0; ks < num_snodes; k += ns, ks++) {
       // Size of the super node
-      int ns = snode_size[ks];
+      ns = snode_size[ks];
 
       // Number of children for this super node
       int nchildren = num_children[ks];
@@ -293,8 +474,14 @@ class SparseLDL {
                             nchildren, stack, F);
 
       // Factor the frontal matrix and save the
-      factor_front_matrix(ks, fully_summed, front_size, front_vars, F, stack,
-                          fact);
+      info = factor_front_matrix(ks, fully_summed, front_size, front_vars, F,
+                                 stack, fact);
+
+      // Check the flag
+      if (info != 0) {
+        info += k;
+        break;
+      }
 
       // Reset the front indices back to -1
       for (int j = 0; j < front_size; j++) {
@@ -306,7 +493,7 @@ class SparseLDL {
     // Clean up the data
     delete[] temp;
 
-    return 0;
+    return info;
   }
 
   /**
@@ -397,8 +584,8 @@ class SparseLDL {
     for (int child = 0; child < nchildren; child++) {
       int delayed_pivots;
       int contrib_size;
-      int* contrib_indices;
-      T* C;
+      const int* contrib_indices;
+      const T* C;
       stack.pop(&delayed_pivots, &contrib_size, &contrib_indices, &C);
 
       // Add the contribution blocks
@@ -417,8 +604,8 @@ class SparseLDL {
   /**
    * @brief Factor the frontal matrix now that it is assembled.
    *
-   * After factorization, push the contribution matrix to the stack and add the
-   * factorization pieces
+   * After factorization, push the contribution matrix to the stack and add
+   * the factorization pieces
    *
    * @param ks The index of the super node
    * @param fully_summed The number of fully summed equations
@@ -428,14 +615,33 @@ class SparseLDL {
    * @param stack The stack for the contribution blocks
    * @param factor The factor contributions
    */
-  void factor_front_matrix(const int ks, const int fully_summed,
-                           const int front_size, const int front_vars[], T F[],
-                           ContributionStack& stack, MatrixFactor& factor) {
+  int factor_front_matrix(const int ks, const int fully_summed,
+                          const int front_size, const int front_vars[], T F[],
+                          ContributionStack& stack, MatrixFactor& factor) {
     // Select the pivots
-    int num_pivots = 0;
 
-    // Perform the numerical factorization here..
-    int num_delayed = fully_summed - num_pivots;
+    // For now, perform a pure Cholesky factorization
+    // [L11   0][I  0  ][L11^{T} L21^{T}] = [F11  .sym]
+    // [L21   I][0  F22][0             I]   [F21   F22]
+
+    int num_delayed = 0;
+    int num_pivots = fully_summed;
+    int contrib_size = front_size - num_pivots;
+
+    int ldf = front_size;
+    int info;
+    dpotrf_("L", &num_pivots, F, &ldf, &info);
+
+    double alpha = 1.0;
+    dtrsm_("R", "L", "T", "N", &contrib_size, &num_pivots, &alpha, F, &ldf,
+           &F[num_pivots], &ldf);
+
+    alpha = -1.0;
+    double beta = 1.0;
+    blas_syrk<T>("L", "N", &contrib_size, &num_pivots, &alpha, &F[num_pivots],
+                 &ldf, &beta, &F[num_pivots * (ldf + 1)], &ldf);
+
+    // Push this onto the stack
     stack.push(num_pivots, num_delayed, front_size, front_vars, F);
 
     // Push the factored matrix
@@ -443,6 +649,8 @@ class SparseLDL {
     const int* delayed = &front_vars[num_pivots];
     factor.add_factor(ks, num_pivots, pivots, num_delayed, delayed,
                       front_size - fully_summed, F);
+
+    return info;
   }
 
   /**
@@ -516,6 +724,14 @@ class SparseLDL {
       contrib_ptr[i + 1] += contrib_ptr[i];
     }
 
+    // Find the max contribution size
+    max_contrib = 0;
+    for (int i = 0; i < num_snodes; i++) {
+      if (contrib_ptr[i + 1] - contrib_ptr[i] > max_contrib) {
+        max_contrib = contrib_ptr[i + 1] - contrib_ptr[i];
+      }
+    }
+
     // Fill in the rows in the contribution blocks
     contrib_rows = new int[contrib_ptr[num_snodes]];
     build_nonzero_pattern(ncols, colp, rows, parent, num_snodes, snode_size,
@@ -523,7 +739,7 @@ class SparseLDL {
                           work);
 
     // Allocate the arrays within the factorization
-    fact.allocate(ncols, num_snodes, cholesky_nnz);
+    fact.allocate(ncols, num_snodes, 2 * cholesky_nnz + ncols);
 
     delete[] work;
     delete[] parent;
@@ -869,9 +1085,10 @@ class SparseLDL {
   // Number of children for each super node
   int* num_children;
 
-  // Compute the contribution blocks sizes (without delayed pivots)
-  int* contrib_ptr;
-  int* contrib_rows;
+  // The contribution blocks sizes (without delayed pivots)
+  int max_contrib;    // Max size
+  int* contrib_ptr;   // Pointer into the rows
+  int* contrib_rows;  // Contribution rows
 
   // Storage for the matrix factorization
   MatrixFactor fact;
