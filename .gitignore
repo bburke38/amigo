@@ -11,6 +11,7 @@ include/amigo_include_paths.h
 *.dll
 /_build_debug
 /amigo/amigo.cpython*
+/**/_amigo_build
 
 # Compiled Python
 **/__pycache__

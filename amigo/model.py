@@ -521,9 +521,10 @@ class Model:
             )
 
         # Check: if a constraint listed here is also declared in a registered Python
-        # component, that component must have an empty compute(). If compute() is non-empty,
-        # both the Python side and the external component will write to the same constraint,
-        # causing a segfault in the C++ layer.
+        # component, that component must have an empty compute(). Both the Python component
+        # and the external component accumulate their contributions to the same constraint
+        # index via +=, so a non-empty compute() on the Python side will cause the constraint
+        # to be double-counted, producing incorrect KKT residuals.
         for con_expr in constraints:
             parts = con_expr.rsplit(".", 1)
             if len(parts) == 2:
@@ -536,9 +537,11 @@ class Model:
                                 f"add_external_component '{name}': constraint "
                                 f"'{con_expr}' is also declared in Python component "
                                 f"'{comp_name}', which has a non-empty compute(). "
-                                f"The Python component must have an empty compute() when "
-                                f"an external component handles the constraint — otherwise "
-                                f"both will write to the same constraint, causing a segfault."
+                                f"Both components accumulate contributions to the same "
+                                f"constraint index, so the constraint will be double-counted "
+                                f"and produce incorrect KKT residuals. The Python component "
+                                f"must have an empty compute() and serve only as a placeholder "
+                                f"to declare the constraint variable and its bounds."
                             )
 
         self.external_comp[name] = ExternalComponent(
