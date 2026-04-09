@@ -37,6 +37,7 @@ smt_ext = ExternalSMTComponent(num_points=1, num_inputs=1, smt_model=sm)
 # ── Amigo components ──────────────────────────────────────────────────────────
 class Source(am.Component):
     """Holds the design variable x and the surrogate output y."""
+
     def __init__(self):
         super().__init__()
         self.add_input("x")
@@ -50,6 +51,7 @@ class SMTConstraintPlaceholder(am.Component):
     generates no C++ group for this component.  The ExternalSMTComponent is
     the sole writer of 'res'.
     """
+
     def __init__(self):
         super().__init__()
         self.add_constraint("res")
@@ -57,6 +59,7 @@ class SMTConstraintPlaceholder(am.Component):
 
 class Objective(am.Component):
     """Minimize x."""
+
     def __init__(self):
         super().__init__()
         self.add_input("x")
@@ -95,23 +98,27 @@ lower = model.create_vector()
 upper = model.create_vector()
 
 xvec["src.x"] = 1.0
-xvec["src.y"] = float(sm.predict_values(np.array([[1.0]]))[0, 0])  # on surrogate → res ≈ 0
+xvec["src.y"] = float(
+    sm.predict_values(np.array([[1.0]]))[0, 0]
+)  # on surrogate → res ≈ 0
 
 lower["src.x"] = 0.0
 upper["src.x"] = 2.0
-lower["src.y"] = 0.25   # y >= 0.25  drives x >= 0.5 via the surrogate constraint
+lower["src.y"] = 0.25  # y >= 0.25  drives x >= 0.5 via the surrogate constraint
 upper["src.y"] = float("inf")
 
 # ── Optimize ──────────────────────────────────────────────────────────────────
 opt = am.Optimizer(model, xvec, lower=lower, upper=upper)
-opt.optimize({
-    "max_iterations": 200,
-    "initial_barrier_param": 1.0,
-    "convergence_tolerance": 1e-10,
-    "max_line_search_iterations": 10,
-    "init_affine_step_multipliers": False,
-    "init_least_squares_multipliers": False,
-})
+opt.optimize(
+    {
+        "max_iterations": 200,
+        "initial_barrier_param": 1.0,
+        "convergence_tolerance": 1e-10,
+        "max_line_search_iterations": 10,
+        "init_affine_step_multipliers": False,
+        "init_least_squares_multipliers": False,
+    }
+)
 
 x_opt = xvec["src.x"][0]
 y_opt = xvec["src.y"][0]
