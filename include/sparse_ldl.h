@@ -6,18 +6,33 @@
 
 namespace amigo {
 
-extern "C" {
-
-void dtrtrs_(const char* uplo, const char* trans, const char* diag,
-             const int* n, const int* nrhs, const double* A, const int* lda,
-             double* B, const int* ldb, int* info);
-}
-
 template <typename T>
 class SparseLDL {
  public:
   enum class SolverType { LDL, CHOLESKY };
 
+  /**
+   * @brief Construct the data needed for the LDL factorization with the given
+   * matrix and perform the symbolic factorization phase
+   *
+   * Perform a right-looking multifrontal factorization of the provided matrix
+   * with super nodes.
+   *
+   * The 1x1 pivots selected in the factorization phase must satisfy
+   *
+   * |F[k, k]| >= ustab * max |F[k + 1:, k]|
+   *
+   * This ensures that the multipliers satsify
+   *
+   * |F[k + 1, :]| / |F[k, k]| <= 1 / ustab
+   *
+   * @param mat The CSR matrix (treated as symmetric)
+   * @param solver_type The type of solver (Cholesky or LDL)
+   * @param ustab Stability parameter for 1x1 and 2x2 pivots for the LDL
+   * @param pivot_tol Pivot tolerance below which pivots are treated as zero
+   * @param delay_growth Delayed pivot growth factor (used to estimate memory
+   * requirements)
+   */
   SparseLDL(std::shared_ptr<CSRMat<T>> mat,
             SolverType solver_type = SolverType::LDL, double ustab = 0.01,
             double pivot_tol = 1e-14, double delay_growth = 2.0)
@@ -34,12 +49,16 @@ class SparseLDL {
       ustab = 0.0;
     }
 
-    // Bound the delay growth factor betwen [1.2, 2.0]
-    if (delay_growth < 1.2) {
-      delay_growth = 1.2;
-    }
-    if (delay_growth > 2.0) {
-      delay_growth = 2.0;
+    // Bound the growth factor
+    if (solver_type == SolverType::CHOLESKY) {
+      delay_growth = 1.0;
+    } else {
+      if (delay_growth < 1.0) {
+        delay_growth = 1.0;
+      }
+      if (delay_growth > 10.0) {
+        delay_growth = 10.0;
+      }
     }
 
     // Get the non-zero pattern
@@ -130,30 +149,6 @@ class SparseLDL {
     ~ContributionStack() {
       delete[] idx;
       delete[] work;
-    }
-
-    /**
-     * @brief Get the free space object
-     *
-     * @param int_size
-     * @param int_space
-     * @param work_size
-     * @param work_space
-     */
-    void get_free_space(int* int_size = nullptr, int** int_space = nullptr,
-                        int* work_size = nullptr, T** work_space = nullptr) {
-      if (int_size) {
-        *int_size = max_idx - top_idx;
-      }
-      if (int_space) {
-        *int_space = &idx[top_idx];
-      }
-      if (work_size) {
-        *work_size = max_work - top_work;
-      }
-      if (work_space) {
-        *work_space = &work[top_idx];
-      }
     }
 
     /**
@@ -262,39 +257,45 @@ class SparseLDL {
   class MatrixFactor {
    public:
     MatrixFactor() {
-      ncols = 0;
       num_snodes = 0;
       max_pivots = 0;
       max_delayed = 0;
+
+      int_size = 0;
+      factor_size = 0;
     }
 
     /**
      * @brief Allocate the space for the factored matrix
      *
-     * @param num_cols
-     * @param num_super_nodes
-     * @param factor_nnz
+     * The integer space consists of the number of pivots + delayed for each
+     * super node. The number of non-zeros consists of the non-zeros in the
+     * (L11, L21) combined pivot, delayed and contribution blocks. These sizes
+     * are automatically re-allocated if the prediction is wrong.
+     *
+     * @param num_super_nodes Number of super nodes
+     * @param int_nnz Number of expected integers
+     * @param factor_nnz Number of
      */
-    void allocate(int num_cols, int num_super_nodes, int factor_nnz) {
-      ncols = num_cols;
+    void allocate(int num_super_nodes, int int_nnz, int factor_nnz) {
       num_snodes = num_super_nodes;
       max_pivots = 0;
       max_delayed = 0;
 
+      // Set all of the values to an empty node
       meta.assign(num_snodes, NodeMeta{});
 
-      int_data.clear();
-      factor_data.clear();
-
-      // Optional preallocation
-      int_data.reserve(factor_nnz);
-      factor_data.reserve(factor_nnz);
+      // Preallocation
+      int_data.resize(int_nnz);
+      factor_data.resize(factor_nnz);
     }
 
     /**
      * @brief Clear the data before factoring the matrix
      */
     void clear() {
+      int_size = 0;
+      factor_size = 0;
       int_data.clear();
       factor_data.clear();
     }
@@ -330,13 +331,92 @@ class SparseLDL {
         max_pivots = num_pivots;
       }
 
-      m.int_offset = static_cast<int>(int_data.size());
-      int_data.insert(int_data.end(), pivots, pivots + num_pivots);
-      int_data.insert(int_data.end(), delayed, delayed + num_delayed);
-      int_data.insert(int_data.end(), ipiv, ipiv + num_ipiv);
+      m.int_offset = int_size;
+      m.factor_offset = factor_size;
 
-      m.factor_offset = static_cast<int>(factor_data.size());
-      factor_data.insert(factor_data.end(), L, L + block_size);
+      // Check if we need to resize the vector
+      int new_int_size = num_pivots + num_delayed + num_ipiv;
+      if (int_size + new_int_size > int_data.size()) {
+        int_data.resize(int(int_size + new_int_size + 0.5 * int_data.size()));
+      }
+
+      // Insert the data into the stored factorization
+      int* iptr = int_data.data();
+      std::copy(pivots, pivots + num_pivots, iptr + int_size);
+      int_size += num_pivots;
+      std::copy(delayed, delayed + num_delayed, iptr + int_size);
+      int_size += num_delayed;
+      std::copy(ipiv, ipiv + num_ipiv, iptr + int_size);
+      int_size += num_ipiv;
+
+      // Check if we need to to resize the factor data vector
+      if (factor_size + block_size > factor_data.size()) {
+        factor_data.resize(
+            int(factor_size + block_size + 0.5 * factor_data.size()));
+      }
+
+      // Insert the data into the stored factorization
+      T* ptr = factor_data.data();
+      std::copy(L, L + block_size, ptr + factor_size);
+      factor_size += block_size;
+    }
+
+    /**
+     * @brief For the root factorization, get the raw pointers to reserved space
+     * in the factorization.
+     *
+     * This data must be filled in by the factorization code!
+     *
+     * @param ks The supernode index
+     * @param num_pivots The number of pivots for this node
+     * @param pivots The pivot variable numbers
+     * @param L The factor entries
+     * @param ipiv Entries of ipiv
+     */
+    void reserve_factor_root(int ks, int num_pivots, int* pivots[], T* L[],
+                             int* ipiv[]) {
+      int block_size = num_pivots * num_pivots;
+
+      NodeMeta& m = meta[ks];
+      m.num_pivots = num_pivots;
+      m.num_delayed = 0;
+      m.num_ipiv = num_pivots;
+
+      if (num_pivots > max_pivots) {
+        max_pivots = num_pivots;
+      }
+
+      m.int_offset = int_size;
+      m.factor_offset = factor_size;
+
+      // Check the integer space needed
+      int new_int_size = 2 * num_pivots;
+      if (int_size + new_int_size > int_data.size()) {
+        int_data.resize(int(int_size + new_int_size + 0.5 * int_data.size()));
+      }
+
+      // Check if we need to to resize the factor data vector
+      if (factor_size + block_size > factor_data.size()) {
+        factor_data.resize(
+            int(factor_size + block_size + 0.5 * factor_data.size()));
+      }
+
+      // Increase the size of the offsets
+      factor_size += block_size;
+      int_size += 2 * num_pivots;
+
+      int* iptr = int_data.data();
+      if (pivots) {
+        *pivots = &iptr[m.int_offset];
+      }
+      if (ipiv) {
+        *ipiv = &iptr[m.int_offset + num_pivots];
+      }
+
+      T* ptr = factor_data.data();
+      if (L) {
+        *L = &ptr[m.factor_offset];
+      }
     }
 
     /**
@@ -364,15 +444,26 @@ class SparseLDL {
         *num_ipiv = m.num_ipiv;
       }
 
+      // Pivots must always be defined
       if (pivots) {
         *pivots = &int_data[m.int_offset];
       }
+
+      // Delayed pivots may or may not be defined
       if (delayed) {
-        *delayed = &int_data[m.int_offset + m.num_pivots];
+        if (m.num_delayed == 0) {
+          *delayed = nullptr;
+        } else {
+          *delayed = &int_data[m.int_offset + m.num_pivots];
+        }
       }
+
+      // L must always be defined
       if (L) {
         *L = &factor_data[m.factor_offset];
       }
+
+      // ipiv may not be defined
       if (ipiv) {
         if (m.num_ipiv == 0) {
           *ipiv = nullptr;
@@ -396,6 +487,21 @@ class SparseLDL {
      */
     int get_max_delayed() const { return max_delayed; }
 
+    /**
+     * @brief Get the number of nonzeros in the factor
+     *
+     * @param int_nnz The size of the integer vector
+     * @param factor_nnz The size of the factor vector
+     */
+    void get_num_nonzeros(int* int_nnz, int* factor_nnz) const {
+      if (int_nnz) {
+        *int_nnz = int_size;
+      }
+      if (factor_nnz) {
+        *factor_nnz = factor_size;
+      }
+    }
+
    private:
     struct NodeMeta {
       int num_pivots;
@@ -405,13 +511,14 @@ class SparseLDL {
       int factor_offset;
     };
 
-    int ncols;
     int num_snodes;
     int max_pivots;
     int max_delayed;
 
     std::vector<NodeMeta> meta;
-    std::vector<int> int_data;   // pivots and delayed indices
+    int int_size;
+    std::vector<int> int_data;  // pivots and delayed indices
+    int factor_size;
     std::vector<T> factor_data;  // all L blocks
   };
 
@@ -443,11 +550,11 @@ class SparseLDL {
     int* front_vars = &temp[ncols];  // Variables in the front
 
     // TODO: Compute proper size for the frontal matrix
-    int max_frontal_size = 2 * cholesky_nnz + ncols;
+    int max_frontal_size = cholesky_factor_nnz;
     T* F = new T[max_frontal_size];
 
     // TODO: Compute proper sizes for the stack
-    int size = 2 * cholesky_nnz + ncols;
+    int size = cholesky_factor_nnz;
     ContributionStack stack(size, size);
 
     // Info flag
@@ -499,6 +606,12 @@ class SparseLDL {
 
     // Clean up the data
     delete[] temp;
+
+    // int int_nnz, nnz;
+    // fact.get_num_nonzeros(&int_nnz, &nnz);
+    // std::printf("     %10s   %10s\n", "cholesky", "factor");
+    // std::printf("nnz: %10d   %10d\n", cholesky_factor_nnz, nnz);
+    // std::printf("int: %10d   %10d\n", cholesky_int_nnz, int_nnz);
 
     return info;
   }
@@ -1022,20 +1135,22 @@ class SparseLDL {
                          ContributionStack& stack, MatrixFactor& factor) {
     int n = front_size;
 
-    // Need to check these sizes somehow?
-    int ipiv_size;
-    int* ipiv;
-    int lwork;
-    T* work;
-    stack.get_free_space(&ipiv_size, &ipiv, &lwork, &work);
+    // Get space to fill in
+    int *vars, *ipiv;
+    T* L;
+    factor.reserve_factor_root(ks, n, &vars, &L, &ipiv);
+
+    // The work space size = matrix size
+    T* work = L;
+    int lwork = n * n;
 
     // Factor the matrix
     int info;
-    lapack_sytrf<T>("L", &n, F, &n, ipiv, work, &lwork, &info);
+    lapack_sytrf<T>("L", &n, F, &n, ipiv, L, &lwork, &info);
 
-    // Push the factored matrix onto the stack
-    factor.add_factor(ks, front_size, front_vars, 0, nullptr, 0, F, front_size,
-                      ipiv);
+    // Copy the data into the factorization storage
+    std::copy(front_vars, front_vars + n, vars);
+    std::copy(F, F + n * n, L);
 
     return info;
   }
@@ -1267,18 +1382,25 @@ class SparseLDL {
     // Get the pointers to the factor data
     int num_pivots, num_delayed;
     const int* pivots = nullptr;
+    const int* ipiv = nullptr;
 
     const T* L;
 
     // Get the factor L = (L11, L21) that constitute the factor data
-    fact.get_factor(ks, &num_pivots, &pivots, &num_delayed, nullptr, &L);
+    fact.get_factor(ks, &num_pivots, &pivots, &num_delayed, nullptr, &L,
+                    nullptr, &ipiv);
 
     int num_contrib = contrib_ptr[ks + 1] - contrib_ptr[ks];
     int ldl = num_pivots + num_delayed + num_contrib;
 
+    const int* piv = pivots;
+    if (ipiv) {
+      piv = ipiv;
+    }
+
     int pos = 0, neg = 0;
     for (int i = 0; i < num_pivots;) {
-      if (pivots[i] >= 0) {
+      if (piv[i] >= 0) {
         if (L[i * (ldl + 1)] >= 0.0) {
           pos++;
         } else {
@@ -1502,12 +1624,6 @@ class SparseLDL {
     int* Lnz = new int[ncols];
     count_column_nonzeros(ncols, colp, rows, ipost, parent, Lnz, work);
 
-    // Count up the total number of non-zeros in the Cholesky factorization
-    cholesky_nnz = 0;
-    for (int i = 0; i < ncols; i++) {
-      cholesky_nnz += Lnz[i];
-    }
-
     // Use the work array as a temporary here
     int* post = work;
     for (int i = 0; i < ncols; i++) {
@@ -1560,8 +1676,21 @@ class SparseLDL {
                           var_to_snode, snode_to_var, contrib_ptr, contrib_rows,
                           work);
 
+    // Count up the size for the cholesky factorization
+    cholesky_int_nnz = 0;
+    cholesky_factor_nnz = 0;
+    for (int is = 0; is < num_snodes; is++) {
+      int ns = snode_size[is];
+      int contrib_size = contrib_ptr[is + 1] - contrib_ptr[is];
+      int ldf = contrib_size + ns;
+      cholesky_int_nnz += ns;           // Space to store pivots
+      cholesky_factor_nnz += ns * ldf;  // Space to store factorization
+    }
+
     // Allocate the arrays within the factorization
-    fact.allocate(ncols, num_snodes, 2 * cholesky_nnz + ncols);
+    int int_nnz = int(delay_growth * cholesky_int_nnz);
+    int factor_nnz = int(delay_growth * cholesky_factor_nnz);
+    fact.allocate(num_snodes, int_nnz, factor_nnz);
 
     delete[] work;
     delete[] parent;
@@ -1897,8 +2026,9 @@ class SparseLDL {
   // Estimated growth factor for delayed pivots
   double delay_growth;
 
-  // Number of non-zeros in the Choleksy factorization
-  int cholesky_nnz;
+  // Space required for a Choleksy factorization
+  int cholesky_int_nnz;
+  int cholesky_factor_nnz;
 
   // Number of super nodes in the matrix
   int num_snodes;
