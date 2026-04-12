@@ -61,6 +61,21 @@ class SparseLDL {
       }
     }
 
+    // Initialize data
+    max_frontal_mat_dimension = 0;
+    stack_int_estimate = 0;
+    stack_nnz_estimate = 0;
+    cholesky_int_nnz = 0;
+    cholesky_factor_nnz = 0;
+    num_snodes = 0;
+    snode_size = nullptr;
+    var_to_snode = nullptr;
+    snode_to_var = nullptr;
+    num_children = nullptr;
+    max_contrib = 0;
+    contrib_ptr = nullptr;
+    contrib_rows = nullptr;
+
     // Get the non-zero pattern
     int nrows;
     const int *rowp, *cols;
@@ -112,7 +127,7 @@ class SparseLDL {
   void solve(Vector<T>* xvec) const {
     if (solver_type == SolverType::CHOLESKY) {
       solve_cholesky(xvec);
-    } else {  // solver_type == LDL
+    } else {  // solver_type == SolverType::LDL
       solve_ldl(xvec);
     }
   }
@@ -140,16 +155,11 @@ class SparseLDL {
   class ContributionStack {
    public:
     ContributionStack(int max_idx, int max_work)
-        : max_idx(max_idx), max_work(max_work) {
+        : idx(max_idx), work(max_work) {
       top_idx = 0;
-      idx = new int[max_idx];
       top_work = 0;
-      work = new T[max_work];
     }
-    ~ContributionStack() {
-      delete[] idx;
-      delete[] work;
-    }
+    ~ContributionStack() {}
 
     /**
      * @brief Add the delayed pivots to the list of indices/vars
@@ -204,8 +214,13 @@ class SparseLDL {
      */
     void push(int num_pivots, int num_delayed_pivots, int front_size,
               const int vars[], const T F[]) {
-      // Copy the indices first
+      // Check the size of the integer storage on the stack
       int contrib_size = front_size - num_pivots;
+      if (top_idx + 2 + contrib_size > idx.size()) {
+        idx.resize(int(top_idx + 2 + contrib_size + 0.5 * idx.size()));
+      }
+
+      // Copy the values and set the values
       std::copy(vars + num_pivots, vars + front_size, &idx[top_idx]);
       top_idx += contrib_size;
 
@@ -214,12 +229,20 @@ class SparseLDL {
       idx[top_idx + 1] = contrib_size;
       top_idx += 2;
 
+      // Check the size of the contribution block
+      int block_size = contrib_size * contrib_size;
+      if (top_work + block_size > work.size()) {
+        work.resize(int(top_work + block_size + 0.5 * work.size()));
+      }
+
       // Copy the values into the data array
-      for (int j = num_pivots; j < front_size; j++) {
-        for (int i = num_pivots; i < front_size; i++, top_work++) {
-          work[top_work] = F[i + front_size * j];
+      T* ptr = &work[top_work];
+      for (int j = num_pivots, k = 0; j < front_size; j++) {
+        for (int i = num_pivots; i < front_size; i++, k++) {
+          ptr[k] = F[i + front_size * j];
         }
       }
+      top_work += block_size;
     }
 
     /**
@@ -243,12 +266,10 @@ class SparseLDL {
     }
 
    private:
-    int max_idx;   // Max size of the idx array
-    int top_idx;   // Top of the index stack
-    int* idx;      // Index/size values
-    int max_work;  // Max size of the array
-    int top_work;  // Top of the entry stack
-    T* work;       // Entries in the matrix
+    int top_idx;           // Top of the index stack
+    std::vector<int> idx;  // Index/size values
+    int top_work;          // Top of the entry stack
+    std::vector<T> work;   // Entries in the matrix
   };
 
   /**
@@ -525,17 +546,21 @@ class SparseLDL {
   /**
    * @brief Perform the multifrontal factorization
    *
-   * Factor children that this front depends on
-   * for children in front:
-   *   factor_child(children);
+   * The overall algorithm is the following:
    *
-   * Find all the variables in this front
+   * for each supernode:
+   *   Find the frontal variables from the children
+   *   Assemble the frontal matrix from the children
+   *   Factor the frontal matrix
+   *   Store the factorization pieces
+   *   Push the contribution onto the stack
    *
-   * Assemble the frontal matrix
-   *
-   * Pivot based on the fully summed nodes
-   *
-   * Compute the contribution block
+   * @tparam stype The type of factorization (LDL or Cholesky)
+   * @param ncols The number of columns
+   * @param colp Pointer into the column
+   * @param rows Row indices for each column
+   * @param data Values for the matrix entries
+   * @return int Return flag (0 for success)
    */
   template <SolverType stype>
   int factor_numeric(const int ncols, const int colp[], const int rows[],
@@ -549,13 +574,14 @@ class SparseLDL {
     int* front_indices = temp;       // Indices in the front matrix
     int* front_vars = &temp[ncols];  // Variables in the front
 
-    // TODO: Compute proper size for the frontal matrix
-    int max_frontal_size = cholesky_factor_nnz;
-    T* F = new T[max_frontal_size];
+    // Compute proper size for the frontal matrix
+    int fdim = int(delay_growth * max_frontal_mat_dimension);
+    std::vector<T> F(fdim * fdim);
 
-    // TODO: Compute proper sizes for the stack
-    int size = cholesky_factor_nnz;
-    ContributionStack stack(size, size);
+    // Use estimates of the contribution stack sizes
+    int int_estimate = int(delay_growth * stack_int_estimate);
+    int nnz_estimate = int(delay_growth * stack_nnz_estimate);
+    ContributionStack stack(int_estimate, nnz_estimate);
 
     // Info flag
     int info = 0;
@@ -572,22 +598,32 @@ class SparseLDL {
       get_frontal_vars(ks, k, ns, nchildren, stack, front_indices, front_vars,
                        &fully_summed, &front_size);
 
+      // Resize the frontal matrix if needed
+      if (front_size > fdim) {
+        fdim = front_size;
+        F.resize(fdim * fdim);
+      }
+
+      // Get the underlying array
+      T* Fptr = F.data();
+
       // Assemble the frontal matrix
       assemble_front_matrix(k, ns, front_size, front_indices, colp, rows, data,
-                            nchildren, stack, F);
+                            nchildren, stack, Fptr);
 
       // Factor the frontal matrix and save the results
       int info = 0;
       if constexpr (stype == SolverType::CHOLESKY) {
         // The Cholesky code works for both frontal and root matrices
         info = factor_front_matrix_cholesky(ks, fully_summed, front_size,
-                                            front_vars, F, stack, fact);
+                                            front_vars, Fptr, stack, fact);
       } else {
         if (fully_summed < front_size) {
           info = factor_front_matrix(ks, fully_summed, front_size, front_vars,
-                                     F, stack, fact);
+                                     Fptr, stack, fact);
         } else {  // fully_summed = front_size
-          info = factor_root_matrix(ks, front_size, front_vars, F, stack, fact);
+          info =
+              factor_root_matrix(ks, front_size, front_vars, Fptr, stack, fact);
         }
       }
 
@@ -606,12 +642,6 @@ class SparseLDL {
 
     // Clean up the data
     delete[] temp;
-
-    // int int_nnz, nnz;
-    // fact.get_num_nonzeros(&int_nnz, &nnz);
-    // std::printf("     %10s   %10s\n", "cholesky", "factor");
-    // std::printf("nnz: %10d   %10d\n", cholesky_factor_nnz, nnz);
-    // std::printf("int: %10d   %10d\n", cholesky_int_nnz, int_nnz);
 
     return info;
   }
@@ -1676,16 +1706,7 @@ class SparseLDL {
                           var_to_snode, snode_to_var, contrib_ptr, contrib_rows,
                           work);
 
-    // Count up the size for the cholesky factorization
-    cholesky_int_nnz = 0;
-    cholesky_factor_nnz = 0;
-    for (int is = 0; is < num_snodes; is++) {
-      int ns = snode_size[is];
-      int contrib_size = contrib_ptr[is + 1] - contrib_ptr[is];
-      int ldf = contrib_size + ns;
-      cholesky_int_nnz += ns;           // Space to store pivots
-      cholesky_factor_nnz += ns * ldf;  // Space to store factorization
-    }
+    estimate_cholesky_nonzeros(work);
 
     // Allocate the arrays within the factorization
     int int_nnz = int(delay_growth * cholesky_int_nnz);
@@ -2011,6 +2032,68 @@ class SparseLDL {
     }
   }
 
+  /**
+   * @brief Estimate the non-zeros in the factor and stack and max frontal
+   * matrix size. This serves as an estimate of the
+   *
+   * @param work Work array of at least size 2 * num_snodes
+   */
+  void estimate_cholesky_nonzeros(int work[]) {
+    // Maximum frontal matrix size
+    max_frontal_mat_dimension = 0;
+
+    // Estimate the size of the stack
+    stack_int_estimate = 0;
+    stack_nnz_estimate = 0;
+
+    int top = 0;
+    for (int ks = 0; ks < num_snodes; ks++) {
+      int ns = snode_size[ks];
+
+      // Find the total stack size at this point
+      int int_size = 0;
+      int nnz_size = 0;
+      for (int tmp_top = top; tmp_top >= 0; tmp_top -= 2) {
+        int_size += work[tmp_top];
+        nnz_size += work[tmp_top + 1];
+      }
+
+      // Now pop the children off the stack
+      for (int k = 0; k < num_children[ks]; k++) {
+        top -= 2;
+      }
+
+      if (int_size > stack_int_estimate) {
+        stack_int_estimate = int_size;
+      }
+      if (nnz_size > stack_nnz_estimate) {
+        stack_nnz_estimate = nnz_size;
+      }
+
+      int contrib_size = contrib_ptr[ks + 1] - contrib_ptr[ks];
+
+      if (max_frontal_mat_dimension > ns + contrib_size) {
+        max_frontal_mat_dimension = ns + contrib_size;
+      }
+
+      // Push this contribution on to the stack
+      work[top] = 2 + contrib_size;
+      work[top + 1] = contrib_size * contrib_size;
+      top += 2;
+    }
+
+    // Count up the size for the cholesky factorization
+    cholesky_int_nnz = 0;
+    cholesky_factor_nnz = 0;
+    for (int is = 0; is < num_snodes; is++) {
+      int ns = snode_size[is];
+      int contrib_size = contrib_ptr[is + 1] - contrib_ptr[is];
+      int ldf = contrib_size + ns;
+      cholesky_int_nnz += ns;           // Space to store pivots
+      cholesky_factor_nnz += ns * ldf;  // Space to store factorization
+    }
+  }
+
   // The matrix
   std::shared_ptr<CSRMat<T>> mat;
 
@@ -2025,6 +2108,13 @@ class SparseLDL {
 
   // Estimated growth factor for delayed pivots
   double delay_growth;
+
+  // Space required for the frontal matrix for a Cholesky
+  int max_frontal_mat_dimension;
+
+  // Space required for the stack and the max front size
+  int stack_int_estimate;
+  int stack_nnz_estimate;
 
   // Space required for a Choleksy factorization
   int cholesky_int_nnz;

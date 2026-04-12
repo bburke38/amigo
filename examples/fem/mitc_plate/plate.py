@@ -90,7 +90,10 @@ parser.add_argument(
     "--build", dest="build", action="store_true", default=False, help="Enable building"
 )
 parser.add_argument(
-    "--solver", dest="solver", choices=["cholesky", "ldl", "scipy"], default="cholesky"
+    "--solver",
+    dest="solver",
+    choices=["cholesky", "cholesky_left", "ldl", "scipy"],
+    default="cholesky",
 )
 args = parser.parse_args()
 
@@ -164,7 +167,22 @@ model.eval_hessian(x, mat)
 print("Solving...")
 
 start_time = time.perf_counter()
-if args.solver == "cholesky":
+
+if args.solver == "cholesky" or args.solver == "ldl":
+    stype = am.SolverType.CHOLESKY
+    if args.solver == "ldl":
+        stype = am.SolverType.LDL
+
+    ldl = am.SparseLDL(mat, stype, ustab=0.01)
+    flag = ldl.factor()
+    if flag != 0:
+        print(f"LDL factor flag {flag}")
+
+    x[:] = g[:]
+    ldl.solve(x.get_vector())
+    if stype == am.SolverType.LDL:
+        print("Inertia: ", ldl.get_inertia())
+elif args.solver == "cholesky_left":
     chol = am.SparseCholesky(mat)
     flag = chol.factor()
     if flag != 0:
@@ -172,15 +190,6 @@ if args.solver == "cholesky":
 
     x[:] = g[:]
     chol.solve(x.get_vector())
-elif args.solver == "ldl":
-    ldl = am.SparseLDL(mat, am.SolverType.LDL, ustab=0.01)
-    flag = ldl.factor()
-    if flag != 0:
-        print(f"LDL factor flag {flag}")
-
-    x[:] = g[:]
-    ldl.solve(x.get_vector())
-    print("Inertia: ", ldl.get_inertia())
 elif args.solver == "scipy":
     csr = am.tocsr(mat)
     x[:] = spsolve(csr, g[:])
