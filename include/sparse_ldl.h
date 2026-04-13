@@ -742,14 +742,37 @@ class SparseLDL {
         contrib_indices[i] = front_indices[contrib_indices[i]];
       }
 
-      // Add the contribution block
-      for (int j = 0; j < contrib_size; j++) {
-        int jfront = contrib_indices[j];
+      // Columns from the delayed pivots
+      for (int j = 0; j < delayed_pivots; j++) {
+        const int jfront = contrib_indices[j];
         T* Fj = &F[front_size * jfront];
-        T* Cj = &C[contrib_size * j];
+        const T* Cj = &C[contrib_size * j];
 
+        for (int i = 0; i < contrib_size; i++) {
+          const int ifront = contrib_indices[i];
+          if (ifront >= jfront) {
+            Fj[ifront] += Cj[i];
+          }
+        }
+      }
+
+      // Columns that are sorted
+      for (int j = delayed_pivots; j < contrib_size; j++) {
+        const int jfront = contrib_indices[j];
+        T* Fj = &F[front_size * jfront];
+        const T* Cj = &C[contrib_size * j];
+
+        // Unsorted rows from the delayed pivots
+        for (int i = 0; i < delayed_pivots; i++) {
+          const int ifront = contrib_indices[i];
+          if (ifront >= jfront) {
+            Fj[ifront] += Cj[i];
+          }
+        }
+
+        // Sorted rows (no check needed)
         for (int i = j; i < contrib_size; i++) {
-          int ifront = contrib_indices[i];
+          const int ifront = contrib_indices[i];
           Fj[ifront] += Cj[i];
         }
       }
@@ -1173,7 +1196,7 @@ class SparseLDL {
     T beta = 1.0;
 
     // Apply the regular update
-    if (ndim < 128) {
+    if (ndim < 32) {
       blas_gemm<T>("N", "N", &ndim, &ndim, &kdim, &alpha, A, &lda, B, &ldb,
                    &beta, C, &ldc);
     } else {
