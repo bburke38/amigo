@@ -253,8 +253,7 @@ class SparseLDL {
      * @param vars Indices for the contribution block
      * @param C The contribution block values
      */
-    void pop(int* delayed_pivots, int* contrib_size, const int* vars[],
-             const T* C[]) {
+    void pop(int* delayed_pivots, int* contrib_size, int* vars[], T* C[]) {
       *delayed_pivots = idx[top_idx - 2];
       int cb_size = idx[top_idx - 1];
       *contrib_size = cb_size;
@@ -715,6 +714,7 @@ class SparseLDL {
     for (int j = 0; j < ns; j++) {
       // Get the column variable associated with the snode
       int var = snode_to_var[k + j];
+      T* Fj = &F[front_size * j];
 
       for (int ip = colp[var]; ip < colp[var + 1]; ip++) {
         // Get the
@@ -725,7 +725,7 @@ class SparseLDL {
 
         // Add the contribution to the frontal matrix
         if (ifront >= 0) {
-          F[ifront + front_size * j] += data[ip];
+          Fj[ifront] += data[ip];
         }
       }
     }
@@ -734,18 +734,23 @@ class SparseLDL {
     for (int child = 0; child < nchildren; child++) {
       int delayed_pivots;
       int contrib_size;
-      const int* contrib_indices;
-      const T* C;
+      int* contrib_indices;
+      T* C;
       stack.pop(&delayed_pivots, &contrib_size, &contrib_indices, &C);
 
-      // Add the contribution blocks
       for (int i = 0; i < contrib_size; i++) {
-        int ifront = front_indices[contrib_indices[i]];
+        contrib_indices[i] = front_indices[contrib_indices[i]];
+      }
 
-        for (int j = 0; j < contrib_size; j++) {
-          int jfront = front_indices[contrib_indices[j]];
+      // Add the contribution block
+      for (int j = 0; j < contrib_size; j++) {
+        int jfront = contrib_indices[j];
+        T* Fj = &F[front_size * jfront];
+        T* Cj = &C[contrib_size * j];
 
-          F[ifront + front_size * jfront] += C[i + contrib_size * j];
+        for (int i = j; i < contrib_size; i++) {
+          int ifront = contrib_indices[i];
+          Fj[ifront] += Cj[i];
         }
       }
     }
