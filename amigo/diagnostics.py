@@ -27,7 +27,7 @@ The five checks
    components but whose global indices don't overlap are likely missing a
    ``model.link()`` call.
 4. **Constraint residuals** - evaluate all constraints using
-   ``model.eval_constraints(x)`` and report ``max|res|`` / ``mean|res|`` for
+   ``self._eval_constraints(x)`` and report ``max|res|`` / ``mean|res|`` for
    each group.  The largest value is an estimate of ``inf_pr`` at iter 0.
 5. **Spotlight constraints** - read named constraint-residual variables
    directly from ``x`` (useful for IC/FC whose values the user seeds during
@@ -143,6 +143,51 @@ class Diagnostics:
         }
 
         return total_fail, fail_dict
+
+    def _eval_constraints(self, x: ModelVector) -> dict:
+        """Evaluate all constraint functions at x without running the optimizer.
+
+        Uses the gradient infrastructure: with alpha=0, the gradient vector g
+        is zeroed at primal positions (no objective contribution), and entries
+        at the multiplier positions contain c(x) for every equality constraint.
+        This follows the KKT structure where g[mult] = c(x).
+
+        Returns
+        -------
+        dict
+            Maps each constraint group name (e.g. ``"ac.res"``, ``"trap.res"``)
+            to a numpy array of residual values evaluated at x.
+
+        Raises
+        ------
+        RuntimeError
+            If the total size of named constraint groups does not match the
+            number of multiplier variables, indicating an ordering mismatch.
+        """
+        g = self.model.create_vector()
+        self.model.eval_gradient(x, g, alpha=0.0)
+        g_arr = np.asarray(g[:], dtype=float)
+
+        mult_mask = np.asarray(
+            self.model.problem.get_multiplier_indicator(), dtype=bool
+        )
+        c_flat = g_arr[mult_mask]
+
+        result = {}
+        k = 0
+        _, cons_names, _, _ = self.model.get_names()
+        for name in cons_names:
+            n = int(np.atleast_1d(self.model.get_indices(name)).size)
+            result[name] = c_flat[k : k + n]
+            k += n
+
+        if k != len(c_flat):
+            raise RuntimeError(
+                f"eval_constraints: named constraints sum to {k} entries "
+                f"but multiplier vector has {len(c_flat)}. "
+                "Constraint ordering mismatch — please report this as a bug."
+            )
+        return result
 
     # ── check 1: NaN / Inf ────────────────────────────────────────────────────
 
@@ -364,13 +409,13 @@ class Diagnostics:
 
         return fail
 
-    # ── check 4: constraint residuals via model.eval_constraints ─────────────
+    # ── check 4: constraint residuals via _eval_constraints ─────────────
 
     def _check_constraints(self) -> bool:
         fail = False
-        print("\n  [4] Constraint residuals (model.eval_constraints)")
+        print("\n  [4] Constraint residuals")
         try:
-            residuals = self.model.eval_constraints(self.x)
+            residuals = self._eval_constraints(self.x)
         except Exception as exc:
             print(f"      [ERR]  eval_constraints failed: {exc}")
             fail = True
