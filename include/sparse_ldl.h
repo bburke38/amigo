@@ -584,7 +584,6 @@ class SparseLDL {
 
     double tsum = 0.0;
     double tfactor = 0.0;
-    double tupdate = 0.0;
 
     // Info flag
     int info = 0;
@@ -622,17 +621,14 @@ class SparseLDL {
       if constexpr (stype == SolverType::CHOLESKY) {
         // The Cholesky code works for both frontal and root matrices
         info = factor_front_matrix_cholesky(ks, fully_summed, front_size,
-                                            front_vars, Fptr, stack, fact,
-                                            &tupdate);
+                                            front_vars, Fptr, stack, fact);
       } else {
         if (fully_summed < front_size) {
           info = factor_front_matrix(ks, fully_summed, front_size, front_vars,
-                                     Fptr, stack, fact, &tupdate);
+                                     Fptr, stack, fact);
         } else {  // fully_summed = front_size
-          // double t3 = MPI_Wtime();
           info =
               factor_root_matrix(ks, front_size, front_vars, Fptr, stack, fact);
-          // tupdate += MPI_Wtime() - t3;
         }
       }
       tfactor += MPI_Wtime() - t2;
@@ -652,7 +648,6 @@ class SparseLDL {
 
     std::printf("Assembly time: %.6f\n", tsum);
     std::printf("Factor time:   %.6f\n", tfactor);
-    std::printf("Update time:   %.6f\n", tupdate);
 
     // Clean up the data
     delete[] temp;
@@ -1579,7 +1574,7 @@ class SparseLDL {
   int factor_front_matrix_cholesky(const int ks, const int fully_summed,
                                    const int front_size, const int front_vars[],
                                    T F[], ContributionStack& stack,
-                                   MatrixFactor& factor, double* tupdate) {
+                                   MatrixFactor& factor) {
     // Cholesky implementation
     int num_delayed = 0;
     int num_pivots = fully_summed;
@@ -1599,10 +1594,8 @@ class SparseLDL {
     // F22 = F22 - L21 * L21^{T}
     alpha = -1.0;
     T beta = 1.0;
-    double t1 = MPI_Wtime();
     blas_syrk<T>("L", "N", &contrib_size, &num_pivots, &alpha, &F[num_pivots],
                  &ldf, &beta, &F[num_pivots * (ldf + 1)], &ldf);
-    *tupdate += MPI_Wtime() - t1;
 
     // Push the update to F22 onto the stack
     stack.push(num_pivots, num_delayed, front_size, front_vars, F);
