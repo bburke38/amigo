@@ -1,7 +1,7 @@
 """
 amigo.diagnostics
 =================
-General-purpose pre-optimisation diagnostic checks for any Amigo model.
+General-purpose pre-optimization diagnostic checks for any Amigo model.
 
 Usage
 -----
@@ -58,12 +58,12 @@ def _strip_indices(expr: str) -> str:
 
 
 class Diagnostics:
-    """Pre-optimisation health checks for an initialised Amigo model.
+    """Pre-optimization health checks for an initialized Amigo model.
 
     Parameters
     ----------
     model:
-        An initialised ``am.Model`` instance.
+        An initialized ``am.Model`` instance.
     x:
         Design vector returned by ``model.create_vector()`` and populated
         with the initial guess.
