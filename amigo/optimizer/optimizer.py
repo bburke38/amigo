@@ -20,11 +20,6 @@ from .solvers import (
     AmigoSolver,
 )
 
-try:
-    from petsc4py import PETSc
-except:
-    PETSc = None
-
 
 class InertiaCorrector:
     """Inertia correction for the KKT system (Algorithm IC, Wachter & Biegler 2006).

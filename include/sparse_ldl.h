@@ -582,6 +582,10 @@ class SparseLDL {
     int nnz_estimate = int(delay_growth * stack_nnz_estimate);
     ContributionStack stack(int_estimate, nnz_estimate);
 
+    double tsum = 0.0;
+    double tfactor = 0.0;
+    double tupdate = 0.0;
+
     // Info flag
     int info = 0;
     int ns = 0;
@@ -607,24 +611,31 @@ class SparseLDL {
       T* Fptr = F.data();
 
       // Assemble the frontal matrix
+      double t1 = MPI_Wtime();
       assemble_front_matrix(k, ns, front_size, front_indices, colp, rows, data,
                             nchildren, stack, Fptr);
+      tsum += MPI_Wtime() - t1;
 
       // Factor the frontal matrix and save the results
       int info = 0;
+      double t2 = MPI_Wtime();
       if constexpr (stype == SolverType::CHOLESKY) {
         // The Cholesky code works for both frontal and root matrices
         info = factor_front_matrix_cholesky(ks, fully_summed, front_size,
-                                            front_vars, Fptr, stack, fact);
+                                            front_vars, Fptr, stack, fact,
+                                            &tupdate);
       } else {
         if (fully_summed < front_size) {
           info = factor_front_matrix(ks, fully_summed, front_size, front_vars,
-                                     Fptr, stack, fact);
+                                     Fptr, stack, fact, &tupdate);
         } else {  // fully_summed = front_size
+          // double t3 = MPI_Wtime();
           info =
               factor_root_matrix(ks, front_size, front_vars, Fptr, stack, fact);
+          // tupdate += MPI_Wtime() - t3;
         }
       }
+      tfactor += MPI_Wtime() - t2;
 
       // Check the flag
       if (info != 0) {
@@ -638,6 +649,10 @@ class SparseLDL {
         front_indices[var] = -1;
       }
     }
+
+    std::printf("Assembly time: %.6f\n", tsum);
+    std::printf("Factor time:   %.6f\n", tfactor);
+    std::printf("Update time:   %.6f\n", tupdate);
 
     // Clean up the data
     delete[] temp;
@@ -1564,7 +1579,7 @@ class SparseLDL {
   int factor_front_matrix_cholesky(const int ks, const int fully_summed,
                                    const int front_size, const int front_vars[],
                                    T F[], ContributionStack& stack,
-                                   MatrixFactor& factor) {
+                                   MatrixFactor& factor, double* tupdate) {
     // Cholesky implementation
     int num_delayed = 0;
     int num_pivots = fully_summed;
@@ -1584,8 +1599,10 @@ class SparseLDL {
     // F22 = F22 - L21 * L21^{T}
     alpha = -1.0;
     T beta = 1.0;
+    double t1 = MPI_Wtime();
     blas_syrk<T>("L", "N", &contrib_size, &num_pivots, &alpha, &F[num_pivots],
                  &ldf, &beta, &F[num_pivots * (ldf + 1)], &ldf);
+    *tupdate += MPI_Wtime() - t1;
 
     // Push the update to F22 onto the stack
     stack.push(num_pivots, num_delayed, front_size, front_vars, F);
@@ -2170,6 +2187,9 @@ class SparseLDL {
       cholesky_int_nnz += ns;           // Space to store pivots
       cholesky_factor_nnz += ns * ldf;  // Space to store factorization
     }
+
+    // Add the space for the root ipiv array
+    cholesky_int_nnz += max_frontal_mat_dimension;
   }
 
   // The matrix
