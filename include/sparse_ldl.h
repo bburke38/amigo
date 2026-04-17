@@ -230,7 +230,7 @@ class SparseLDL {
       top_idx += 2;
 
       // Check the size of the contribution block
-      int block_size = contrib_size * contrib_size;
+      int block_size = contrib_size * (contrib_size + 1) / 2;
       if (top_work + block_size > work.size()) {
         work.resize(int(top_work + block_size + 0.5 * work.size()));
       }
@@ -238,7 +238,7 @@ class SparseLDL {
       // Copy the values into the data array
       T* ptr = &work[top_work];
       for (int j = num_pivots; j < front_size; j++) {
-        for (int i = num_pivots; i < front_size; i++, ptr++) {
+        for (int i = j; i < front_size; i++, ptr++) {
           ptr[0] = F[i + front_size * j];
         }
       }
@@ -260,8 +260,9 @@ class SparseLDL {
       *vars = &idx[top_idx - 2 - cb_size];
       top_idx -= (2 + cb_size);
 
-      *C = &work[top_work - cb_size * cb_size];
-      top_work -= cb_size * cb_size;
+      int block_size = cb_size * (cb_size + 1) / 2;
+      *C = &work[top_work - block_size];
+      top_work -= block_size;
     }
 
    private:
@@ -748,7 +749,7 @@ class SparseLDL {
       }
     }
 
-    // Add the contributions
+    // Add the contributions from the children
     for (int child = 0; child < nchildren; child++) {
       int num_delayed_pivots;
       int contrib_size;
@@ -756,16 +757,28 @@ class SparseLDL {
       T* C;
       stack.pop(&num_delayed_pivots, &contrib_size, &contrib_indices, &C);
 
+      // Get the indices of the contribution indices, so we don't have to
+      // reference these again
       for (int i = 0; i < contrib_size; i++) {
         contrib_indices[i] = front_indices[contrib_indices[i]];
       }
 
+      // The delayed pivots may be ordered in any way because of the pivoting
       for (int j = 0; j < num_delayed_pivots; j++) {
         const int jfront = contrib_indices[j];
-        const T* Cj = &C[contrib_size * j];
+
+        // Set the offset into the contribution block. The diagonal C element
+        // for column j is at index n * j - j * (j - 1)/2, but we subtract j
+        // from this since the row index begins at i = j. This accounts for
+        // indexing Cj using i directly.
+        const int cjindex = j * contrib_size - j * (j + 1) / 2;
+        const T* Cj = &C[cjindex];
+
+        // Set the column and row pointers into the frontal matrix
         T* Fj = &F[front_size * jfront];
         T* Fi = &F[jfront];
 
+        // Make sure that the contributions go into the lower part of F
         for (int i = j; i < contrib_size; i++) {
           const int ifront = contrib_indices[i];
           if (ifront >= jfront) {
@@ -776,11 +789,20 @@ class SparseLDL {
         }
       }
 
+      // The remaining contributions are sorted, so we don't have to check if
+      // these contributions - they are from the lower block
       for (int j = num_delayed_pivots; j < contrib_size; j++) {
         const int jfront = contrib_indices[j];
-        const T* Cj = &C[contrib_size * j];
+
+        // Set the offset into the contribution block. This accounts for
+        // indexing Cj using i directly
+        const int cjindex = j * contrib_size - j * (j + 1) / 2;
+        const T* Cj = &C[cjindex];
+
+        // Set the column pointer into the frontal matrix
         T* Fj = &F[front_size * jfront];
 
+        // Add contributions to the lower part of F
         for (int i = j; i < contrib_size; i++) {
           const int ifront = contrib_indices[i];
           Fj[ifront] += Cj[i];
@@ -2133,7 +2155,7 @@ class SparseLDL {
 
       // Push this contribution on to the stack
       work[top] = 2 + contrib_size;
-      work[top + 1] = contrib_size * contrib_size;
+      work[top + 1] = contrib_size * (contrib_size + 1) / 2;
       top += 2;
     }
 
