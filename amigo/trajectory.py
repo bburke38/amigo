@@ -175,7 +175,45 @@ class TrajectoryModel:
 
 
 class TrajModel(am.Model):
+    """
+    Model to streamline continuous-time dynamics and trajectory computation.
+
+    Contains a `TrajectorySource` and `TrajectoryComponent` with automatic linking.
+
+    The `TrajectorySource` is labeled as `source` in this model. The `TrajectoryComponent`
+    is labeled as `kernel`.
+
+    Example Usage
+    -------
+    Consider a problem to minimize the final time.
+    Assume `dynamics` has been previously defined and has an auxiliary input `alpha`.
+    For brevity: setting lower/upper bounds, boundary conditions, etc. are not included.
+    ```
+    traj = am.TrajModel(dynamics)
+
+    model = am.Model("example")
+    model.add_model("traj", traj)
+
+    # Link to a BSpline that controls alpha
+    model.link("traj.source.alpha", "bspline.interp_values.alpha")
+
+    # Link final time from objective
+    model.link("obj.tf[0]", f"traj.kernel.tf[:]")
+    ```
+    """
+
     def __init__(self, dynamics: TrajectoryComponent, module_name: str | None = None):
+        """
+        Initialize a TrajectoryModel.
+
+        Args:
+            dynamics (TrajectoryComponent) : implements the governing dynamical equations
+            module_name (str) : specify name for the module (optional)
+
+        Note:
+        `TrajectorySource` is automatically created based on the input parameters to the
+        trajectory component.
+        """
         super().__init__(module_name)
 
         self._num_time_steps = dynamics.num_time_steps
@@ -201,8 +239,23 @@ class TrajModel(am.Model):
         return
 
     def link_boundary_conditions(
-        self, model, traj_name: str, ic: str = None, fc: str = None
+        self, model: am.Model, traj_name: str, ic: str = None, fc: str = None
     ):
+        """
+        Helper utility to set boundary conditions.
+
+        Args:
+            model (am.Model) : parent model that `TrajModel` belongs to
+            traj_name (str) : name of the `TrajModel` in `model`
+            ic (str) : name of the initial condition
+            fc (str) : name of the final condition
+
+        Effectively replaces the following links:
+        ```
+        model.link("traj.source.q[0,:]", "ic.q[0,:]")
+        model.link("traj.source.q[num_time_steps,:]", "fc.q[0,:]")
+        ```
+        """
         if ic:
             model.link(f"{traj_name}.source.q[0,:]", f"{ic}.q[0,:]")
         if fc:
