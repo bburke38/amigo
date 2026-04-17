@@ -367,8 +367,10 @@ upper["ac.q[:, 2]"] = 25.0
 lower["bspline.control_points.x"] = -25.0
 upper["bspline.control_points.x"] = 25.0
 
+am.Diagnostics(model, x, lower, upper).run()
+
 # Optimize
-opt = am.Optimizer(model, x, lower=lower, upper=upper)
+opt = am.Optimizer(model, x, lower=lower, upper=upper, solver="mumps")
 data = opt.optimize(
     {
         "initial_barrier_param": 1.0,
