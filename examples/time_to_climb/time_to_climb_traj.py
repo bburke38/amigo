@@ -1,7 +1,7 @@
 import amigo as am
 from amigo.interp import BSpline
 import numpy as np
-import sys
+import sys, os
 import matplotlib.pylab as plt
 import niceplots
 import argparse
@@ -14,43 +14,17 @@ num_time_steps = 500
 Min Time to Climb 
 ==============================
 
-This is example from Betts' book "Practical Methods for Optimal Control
+This example is from Betts' book "Practical Methods for Optimal Control
 Using NonlinearProgramming", 3rd edition, Chapter 10: Test Problems.
 
 This is a non-scaled problem with a single component dynamics code
 """
 
 
-class TrapezoidRule(am.Component):
-    def __init__(self):
-        super().__init__()
-
-        self.add_input("tf")  # Final time (back as design variable)
-        self.add_input("q1")
-        self.add_input("q2")
-        self.add_input("q1dot")
-        self.add_input("q2dot")
-
-        self.add_constraint("res")
-
-        return
-
-    def compute(self):
-        tf = self.inputs["tf"]
-        q1 = self.inputs["q1"]
-        q2 = self.inputs["q2"]
-        q1dot = self.inputs["q1dot"]
-        q2dot = self.inputs["q2dot"]
-
-        dt = tf / num_time_steps  # Variable time step based on final time
-        self.constraints["res"] = q2 - q1 - 0.5 * dt * (q1dot + q2dot)
-
-        return
-
-
-class AircraftDynamics(am.Component):
+class AircraftDynamics(am.TrajectoryComponent):
     def __init__(self, scaling):
-        super().__init__()
+        # super().__init__() will automatically create the inputs and constraint
+        super().__init__(num_time_steps, state_size=5, aux_inputs=[{"name": "alpha"}])
 
         self.scaling = scaling
 
@@ -67,17 +41,9 @@ class AircraftDynamics(am.Component):
         self.add_constant("g", value=9.81)
         self.add_constant("conv", value=np.pi / 180.0)
 
-        # Inputs
-        self.add_input("alpha", label="angle of attack (degrees)")
-        self.add_input("q", shape=5, label="state variables")
-        self.add_input("qdot", shape=5, label="state derivatives")
-
-        # Constraint residuals
-        self.add_constraint("res", shape=5, label="dynamics residual")
-
         return
 
-    def compute(self):
+    def dynamics(self, q, alpha):
         # Get constants
         S = self.constants["S"]
         CL_alpha = self.constants["CL_alpha"]
@@ -86,15 +52,8 @@ class AircraftDynamics(am.Component):
         Isp = self.constants["Isp"]
         TtoW = self.constants["TtoW"]
         m0 = self.constants["m0"]
-        gamma_air = self.constants["gamma_air"]
-        R = self.constants["R"]
         g = self.constants["g"]
         conv = self.constants["conv"]
-
-        # Get inputs
-        alpha = self.inputs["alpha"]
-        q = self.inputs["q"]
-        qdot = self.inputs["qdot"]
 
         # State variables
         v = 100.0 * q[0]  # Convert velocity to [m/s]
@@ -103,7 +62,8 @@ class AircraftDynamics(am.Component):
 
         # Atmospheric properties (simplified)
         T_atm = 288.15  # K
-        rho = 1.225  # kg/m^3
+        h_m = q[2] * self.scaling["altitude"]
+        rho = 1.225 * am.exp(-h_m / 8500.0)  # kg/m^3
 
         # Aerodynamics matching original code
         CL = CL_alpha * conv * alpha  # Convert alpha from degrees to radians
@@ -130,20 +90,15 @@ class AircraftDynamics(am.Component):
         cos_gamma = am.cos(gamma_rad)
 
         # Aircraft dynamics equations (matching original computeSystemResidual)
-        res = [
-            qdot[0]
-            - ((T / m) * cos_alpha - (D / m) - g * sin_gamma)
-            / self.scaling["velocity"],
-            conv * qdot[1]
-            - ((T / (m * v) * sin_alpha + (L / (m * v)) - (g / v) * cos_gamma)),
-            qdot[2] - v * sin_gamma / self.scaling["altitude"],
-            qdot[3] - v * cos_gamma / self.scaling["range"],
-            qdot[4] + (T / (g * Isp)) / self.scaling["mass"],
+        qdot = [
+            ((T / m) * cos_alpha - (D / m) - g * sin_gamma) / self.scaling["velocity"],
+            ((T / (m * v) * sin_alpha + (L / (m * v)) - (g / v) * cos_gamma)) / conv,
+            v * sin_gamma / self.scaling["altitude"],
+            v * cos_gamma / self.scaling["range"],
+            -(T / (g * Isp)) / self.scaling["mass"],
         ]
 
-        self.constraints["res"] = res
-
-        return
+        return qdot
 
 
 class Objective(am.Component):
@@ -252,10 +207,11 @@ scaling = {"velocity": 100.0, "altitude": 1000.0, "range": 1000.0, "mass": 1000.
 
 # Create component instances
 ac = AircraftDynamics(scaling)
-trap = TrapezoidRule()
 obj = Objective()
 ic = InitialConditions(scaling)
 fc = FinalConditions(scaling)
+# TrajectoryModel creates a submodel that links the dynamics and an automatic trajectory source
+traj = am.TrajectoryModel(ac)
 
 # Number of bspline control points
 nctrl = 10
@@ -273,42 +229,28 @@ module_name = "time_to_climb"
 model = am.Model(module_name)
 
 # Add components to the model
-model.add_component("ac", num_time_steps + 1, ac)
-model.add_component("trap", 5 * num_time_steps, trap)
 model.add_model("bspline", bspline.create_model())
 model.add_component("obj", 1, obj)
 model.add_component("ic", 1, ic)
 model.add_component("fc", 1, fc)
-
-# Link the trapezoidal rule for each state
-for i in range(5):
-    start = i * num_time_steps
-    end = (i + 1) * num_time_steps
-
-    # Link state variables
-    model.link(f"ac.q[:{num_time_steps}, {i}]", f"trap.q1[{start}:{end}]")
-    model.link(f"ac.q[1:, {i}]", f"trap.q2[{start}:{end}]")
-
-    # Link state derivatives
-    model.link(f"ac.qdot[:-1, {i}]", f"trap.q1dot[{start}:{end}]")
-    model.link(f"ac.qdot[1:, {i}]", f"trap.q2dot[{start}:{end}]")
+# Instead of adding the dynamics and trapezoid integration separately, add the submodel
+model.add_model("traj", traj.create_model())
 
 # Link the alpha values - ac.alpha to bspline output
-model.link("ac.alpha", "bspline.interp_values.alpha")
+model.link("traj.source.alpha", "bspline.interp_values.alpha")
 
 # Link final time from objective to all trapezoidal rule components
-model.link("obj.tf[0]", f"trap.tf[:]")
+model.link("obj.tf[0]", f"traj.kernel.tf[:]")
 
-# Link boundary conditions
-model.link("ac.q[0, :]", "ic.q[0, :]")
-model.link(f"ac.q[{num_time_steps}, :]", "fc.q[0, :]")
+# Link boundary conditions using new utility
+traj.link_boundary_conditions(model, "traj", "ic", "fc")
 
 # Build the module if requested
 if args.build:
     model.build_module()
 
 # Initialize the model
-model.initialize(order_type=am.OrderingType.NESTED_DISSECTION)
+model.initialize()
 
 print(f"Num variables:              {model.num_variables}")
 print(f"Num constraints:            {model.num_constraints}")
@@ -327,14 +269,14 @@ x["obj.tf"] = tf_guess
 t_guess = np.linspace(0, tf_guess, num_time_steps + 1)
 
 # Set the initial guess
-x["ac.q[:, 0]"] = 1.36 + (3.40 - 1.36) * t_guess / tf_guess  # velocity
-x["ac.q[:, 1]"] = 5.0 * np.sin(np.pi * t_guess / tf_guess)  # flight path angle
-x["ac.q[:, 2]"] = 1.0 + (20.0 - 1.0) * t_guess / tf_guess  # altitude
-x["ac.q[:, 3]"] = 1.36 * t_guess  # range
-x["ac.q[:, 4]"] = 19.03 - 0.2 * t_guess / tf_guess  # mass decrease
+x["traj.source.q[:, 0]"] = 1.36 + (3.40 - 1.36) * t_guess / tf_guess  # velocity
+x["traj.source.q[:, 1]"] = 5.0 * np.sin(np.pi * t_guess / tf_guess)  # flight path angle
+x["traj.source.q[:, 2]"] = 1.0 + (20.0 - 1.0) * t_guess / tf_guess  # altitude
+x["traj.source.q[:, 3]"] = 1.36 * t_guess  # range
+x["traj.source.q[:, 4]"] = 19.03 - 0.2 * t_guess / tf_guess  # mass decrease
 
 # Set initial guess for control (constant small angle)
-x["ac.alpha"] = 1.0
+x["traj.source.alpha"] = 1.0
 
 # Set up bounds
 lower = model.create_vector()
@@ -345,29 +287,24 @@ lower["obj.tf"] = 1.0
 upper["obj.tf"] = float("inf")
 
 # Control bounds (matching original -5 to 5 degrees)
-lower["ac.alpha"] = -float("inf")
-upper["ac.alpha"] = float("inf")
+lower["traj.source.alpha"] = -float("inf")
+upper["traj.source.alpha"] = float("inf")
 
 # Unconstrain the state bounds by default
-lower["ac.q"] = -float("inf")
-upper["ac.q"] = float("inf")
-
-lower["ac.qdot"] = -float("inf")
-upper["ac.qdot"] = float("inf")
+lower["traj.source.q"] = -float("inf")
+upper["traj.source.q"] = float("inf")
 
 # State bounds for the flight path angle
-lower["ac.q[:, 1]"] = -90.0
-upper["ac.q[:, 1]"] = 90.0
+lower["traj.source.q[:, 1]"] = -90.0
+upper["traj.source.q[:, 1]"] = 90.0
 
 # State bounds for the altitude
-lower["ac.q[:, 2]"] = 0.0
-upper["ac.q[:, 2]"] = 25.0
+lower["traj.source.q[:, 2]"] = 0.0
+upper["traj.source.q[:, 2]"] = 25.0
 
 # Set the anlge of attack between an lower and an upper bound
 lower["bspline.control_points.x"] = -25.0
 upper["bspline.control_points.x"] = 25.0
-
-am.Diagnostics(model, x, lower, upper).run()
 
 # Optimize
 opt = am.Optimizer(model, x, lower=lower, upper=upper, solver="mumps")
@@ -389,8 +326,8 @@ with open("time_to_climb_opt_data.json", "w") as fp:
 
 # Extract results
 tf_opt = x["obj.tf"][0]  # Extract scalar from array
-q = x["ac.q"]
-alpha = x["ac.alpha"]
+q = x["traj.source.q"]
+alpha = x["traj.source.alpha"]
 t = np.linspace(0, tf_opt, num_time_steps + 1)
 
 # Print the optimized results

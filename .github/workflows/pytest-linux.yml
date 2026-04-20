@@ -1,0 +1,53 @@
+name: pytest (Linux)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout amigo
+        uses: actions/checkout@v4
+
+      - name: Checkout a2d
+        run: git clone --depth 1 https://github.com/smdogroup/a2d.git ../a2d
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake gfortran wget libopenmpi-dev libopenblas-dev liblapack-dev libmetis-dev
+
+      - name: Build ThirdParty-Mumps
+        run: |
+          git clone --depth 1 https://github.com/coin-or-tools/ThirdParty-Mumps.git ~/ThirdParty-Mumps
+          cd ~/ThirdParty-Mumps
+          ./get.Mumps
+          ./configure --prefix=$HOME/mumps-coinor
+          make -j$(nproc)
+          make install
+          echo "MUMPS_LIB_DIR=$HOME/mumps-coinor/lib" >> $GITHUB_ENV
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install amigo
+        env:
+          MUMPS_LIB_DIR: ${{ env.MUMPS_LIB_DIR }}
+        run: |
+          pip install scikit-build-core pybind11 mpi4py numpy scipy matplotlib
+          pip install -e .
+
+      - name: Install test dependencies
+        run: pip install pytest smt
+
+      - name: Run tests
+        env:
+          LD_LIBRARY_PATH: ${{ env.MUMPS_LIB_DIR }}
+        run: pytest tests/ -v
