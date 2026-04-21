@@ -12,21 +12,20 @@ namespace amigo {
  */
 class BlockAMD {
  public:
-  static constexpr int FORMAT_ERROR = -1;
-  static constexpr int STATE_ERROR = -2;
+  enum class AMDReturnFlag { SUCCESS, FORMAT_ERROR, STATE_ERROR };
 
-  static std::string error_code_to_string(int code) {
-    if (code == FORMAT_ERROR) {
+  static std::string error_code_to_string(AMDReturnFlag code) {
+    if (code == AMDReturnFlag::FORMAT_ERROR) {
       return std::string("Detected problem with initial data structure\n");
-    } else if (code == STATE_ERROR) {
+    } else if (code == AMDReturnFlag::STATE_ERROR) {
       return std::string(
           "The pivot row should contain only variables, not elements\n");
     }
     return std::string("Success");
   }
 
-  static int amd(int nvars, int* rowp, int* cols, int nmult, int* mult,
-                 int* perm, int use_exact_degree) {
+  static AMDReturnFlag amd(int nvars, int* rowp, int* cols, int nmult,
+                           int* mult, int* perm, int use_exact_degree) {
     int* alen = new int[nvars];  // Number of entries in a row
     int* elen = new int[nvars];  // Number of elements in a row
     int* slen = new int[nvars];  // The length of each supernode
@@ -47,7 +46,16 @@ class BlockAMD {
     }
 
     if (check_format(nvars, rowp, cols, elen, alen) != 0) {
-      return FORMAT_ERROR;
+      // Free data before exiting
+      delete[] alen;
+      delete[] elen;
+      delete[] degree;
+      delete[] elem_degree;
+      delete[] Lp;
+      delete[] state;
+      delete[] slen;
+
+      return AMDReturnFlag::FORMAT_ERROR;
     }
 
     // Find the correct number of multipliers
@@ -228,7 +236,7 @@ class BlockAMD {
         for (int j = rowp[piv]; j < rowp[piv] + alen[piv]; j++) {
           // This row should be entirely variables by definition
           if (state[cols[j]] <= 0) {
-            return STATE_ERROR;
+            return AMDReturnFlag::STATE_ERROR;
           }
 
           lenlp = 0;
@@ -440,7 +448,7 @@ class BlockAMD {
     delete[] slen;
     delete[] is_multiplier;
 
-    return 0;  // Success!
+    return AMDReturnFlag::SUCCESS;
   }
 
  private:
