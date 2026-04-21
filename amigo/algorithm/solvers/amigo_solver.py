@@ -7,58 +7,32 @@ which lets it drive Algorithm IC inertia correction.
 import numpy as np
 
 from . import DirectSparseSolver
-
-from amigo import MemoryLocation, SolverType, SparseLDL
+from amigo import SolverType, SparseLDL
 
 
 class AmigoSolver(DirectSparseSolver):
     """Direct KKT solver using Amigo's native LDL factorization."""
 
     supports_inertia = True
+    solver_name = "am.SparseLDL"
 
     def __init__(self, problem, ustab=0.01, pivot_tol=1e-14):
-
         self._init_sparse_structure(problem)
+        self.ldl = SparseLDL(self.hess, SolverType.LDL, ustab, pivot_tol)
 
-        stype = SolverType.LDL
-        self.ldl = SparseLDL(self.hess, stype, ustab, pivot_tol)
-
-    def add_diagonal_and_factor(self, diag):
-        """Add diagonal to the already-assembled Hessian and factorize.
-
-        Must be called after assemble_hessian().  Modifies self.hess
-        in-place, so a subsequent retry must use factor() (which
-        re-assembles from scratch).
-        """
-        self.problem.add_diagonal(diag, self.hess)
-        self.hess.copy_data_device_to_host()
+    def _do_factor(self):
+        """Run the LDL numerical factorization on self.hess."""
         flag = self.ldl.factor()
         if flag != 0:
-            raise RuntimeError(f"am.SparseLDL factorization failed with flag = {flag}")
+            raise RuntimeError(
+                f"{self.solver_name} factorization failed with flag = {flag}"
+            )
 
-    def factor(self, alpha, x, diag, post_hessian=None):
-        """Assemble the Hessian, add the diagonal, and factorize in one shot.
-
-        Used during inertia-correction retries where we need a fresh
-        assembly before re-factorizing with a larger regularization.
-        """
-        self.problem.hessian(alpha, x, self.hess)
-        if post_hessian is not None:
-            self.hess.copy_data_device_to_host()
-            post_hessian(self.hess)
-        self.problem.add_diagonal(diag, self.hess)
-        self.hess.copy_data_device_to_host()
-        flag = self.ldl.factor()
-        if flag != 0:
-            raise RuntimeError(f"am.SparseLDL factorization failed with flag = {flag}")
-
-        # Debug print: factorization success flag + inertia counts.
-        # Useful when SparseLDL disagrees with the expected (n_primal+, n_dual-)
-        # signature during inertia correction.
-        npos, nneg = self.ldl.get_inertia()
-        print(
-            f"  [LDL] factor flag={flag}, npos={npos}, nneg={nneg}, total={npos+nneg}"
-        )
+        if self.verbose:
+            npos, nneg = self.ldl.get_inertia()
+            print(
+                f"  [LDL] factor flag={flag}, npos={npos}, nneg={nneg}, total={npos + nneg}"
+            )
 
     def solve(self, bx, px):
         """Solve K x = bx using the stored LDL factorization."""
@@ -68,14 +42,11 @@ class AmigoSolver(DirectSparseSolver):
         self.ldl.solve(px)
         px.copy_host_to_device()
 
-        # Debug print: RHS and solution infinity norms.
-        # A solution magnitude wildly larger than the RHS (or a residual
-        # norm close to ||x|| itself) is a sign that the solve is inaccurate.
-        px_arr = px.get_array()
-        b_nrm = np.max(np.abs(b_arr))
-        x_nrm = np.max(np.abs(px_arr))
-        print(f"  [LDL solve] ||b||_inf={b_nrm:.3e}, ||x||_inf={x_nrm:.3e}")
+        if self.verbose:
+            b_nrm = np.max(np.abs(b_arr))
+            x_nrm = np.max(np.abs(px.get_array()))
+            print(f"  [LDL solve] ||b||_inf={b_nrm:.3e}, ||x||_inf={x_nrm:.3e}")
 
     def get_inertia(self):
-        """Return (n_positive, n_negative) eigenvalue counts from the factorization."""
+        """Return (n_positive, n_negative) from the factorization."""
         return self.ldl.get_inertia()

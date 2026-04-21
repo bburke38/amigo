@@ -152,7 +152,7 @@ class ProblemSetup:
     def _build_inertia_corrector(self, mult_ind, tol, options, comm_rank):
         """Create an InertiaCorrector if the solver supports inertia queries."""
         inertia_corrector = None
-        if hasattr(self.solver, "get_inertia"):
+        if getattr(self.solver, "supports_inertia", False):
             inertia_corrector = InertiaCorrector(mult_ind, self.barrier_param, options)
             if comm_rank == 0:
                 n_primal = int(np.sum(~mult_ind))

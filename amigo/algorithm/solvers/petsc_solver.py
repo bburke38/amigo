@@ -62,7 +62,6 @@ class DirectPetscSolver(LinearSolver):
         self.ksp.setUp()
 
     def solve(self, bx, px):
-
         # Solve the system
         self.b.getArray()[:] = bx.get_array()[: self.nrows_local]
         self.ksp.solve(self.b, self.x)

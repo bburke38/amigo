@@ -19,28 +19,51 @@ class LinearSolver(ABC):
     supports_inertia = False
 
     def get_inertia(self):
-        raise NotImplementedError(
-            "This solver does not support inertia queries"
-        )  # TODO scipy need inertia
-
-
-# TODO: LinearSolver = "solves a system", DirectSparseSolver = "solves a system using an assembled CSR KKT matrix"
+        raise NotImplementedError("This solver does not support inertia queries")
 
 
 class DirectSparseSolver(LinearSolver):
     """Base class for direct solvers with an assembled CSR KKT matrix.
 
-    Subclasses must set in __init__:
+    Subclasses must set in __init__ (via _init_sparse_structure):
         self.problem         # the optimization problem
         self.hess            # CSR matrix handle
         self.rowp, self.cols # CSR structure arrays
         self._diag_indices   # diagonal data-array indices
 
+    Subclasses must implement _do_factor() (the numerical factorization).
     """
 
-    def _init_sparse_structure(self, problem, loc=None):
-        """Alocate the KKT matrix and cache CSR structure."""
+    verbose = False  # gate debug prints
 
+    @abstractmethod
+    def _do_factor(self):
+        """Numerical factorization of self.hess.
+
+        Called after the base class has assembled H, applied any post-hessian
+        scaling, added the diagonal, and copied self.hess to host.  Subclass
+        should factor whatever is now in self.hess and raise on failure.
+        """
+        pass
+
+    def factor(self, alpha, x, diag, post_hessian=None):
+        """Assemble Hessian, add diag, and factor (used for inertia retries)."""
+        self.problem.hessian(alpha, x, self.hess)
+        if post_hessian is not None:
+            self.hess.copy_data_device_to_host()
+            post_hessian(self.hess)
+        self.problem.add_diagonal(diag, self.hess)
+        self.hess.copy_data_device_to_host()
+        self._do_factor()
+
+    def add_diagonal_and_factor(self, diag):
+        """Add diag to already-assembled hess and factor in place."""
+        self.problem.add_diagonal(diag, self.hess)
+        self.hess.copy_data_device_to_host()
+        self._do_factor()
+
+    def _init_sparse_structure(self, problem, loc=None):
+        """Allocate the KKT matrix and cache its CSR structure."""
         from amigo import MemoryLocation
 
         self.problem = problem
