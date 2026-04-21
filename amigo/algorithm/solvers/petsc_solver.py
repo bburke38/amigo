@@ -1,10 +1,12 @@
+from . import LinearSolver
+
 try:
     from petsc4py import PETSc
 except ImportError:
     PETSc = None
 
 
-class DirectPetscSolver:
+class DirectPetscSolver(LinearSolver):
     def __init__(self, comm, mpi_problem):
         self.comm = comm
         self.mpi_problem = mpi_problem

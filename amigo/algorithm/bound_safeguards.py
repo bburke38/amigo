@@ -26,7 +26,7 @@ class BoundSafeguards:
             s_min = np.finfo(np.float64).tiny
         slack_move = 1.81898940354586e-12  # epsilon^{3/4}
 
-        # Read stored slacks (always positive from incremental update)
+        # TODO: move to backend: these array reads (bounds + slack/dual vectors) should be replaced by a single backend.floor_slacks(mu)
         sl = np.array(vars_obj.get_sl())
         su = np.array(vars_obj.get_su())
         lbx = np.array(self.optimizer.get_lbx())

@@ -1,11 +1,12 @@
-from . import LinearSolver
+from . import DirectSparseSolver
+
 import os
 import sys
 import numpy as np
 from amigo import MemoryLocation
 
 
-class MumpsSolver(LinearSolver):
+class MumpsSolver(DirectSparseSolver):
     """Sparse symmetric indefinite solver via MUMPS (LDL^T with inertia).
 
     Uses the MUMPS C interface (dmumps_c) via ctypes. Provides exact

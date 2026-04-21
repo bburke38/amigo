@@ -1,10 +1,10 @@
-from . import LinearSolver
+from . import DirectSparseSolver
 from amigo import MemoryLocation
 from scipy.sparse import csr_matrix
 from scipy.sparse.linalg import splu
 
 
-class DirectScipySolver(LinearSolver):
+class DirectScipySolver(DirectSparseSolver):
 
     supports_inertia = False
 

@@ -1,9 +1,18 @@
-from . import LinearSolver
+"""Amigo's native LDL direct solver for the KKT system.
+
+Wraps the C++ SparseLDL factorization. Supports inertia queries,
+which lets it drive Algorithm IC inertia correction.
+"""
+
+import numpy as np
+
+from . import DirectSparseSolver
+
 from amigo import MemoryLocation, SolverType, SparseLDL
 
 
-class AmigoSolver(LinearSolver):
-    """Use the native Amigo LDL solver"""
+class AmigoSolver(DirectSparseSolver):
+    """Direct KKT solver using Amigo's native LDL factorization."""
 
     supports_inertia = True
 
@@ -16,7 +25,6 @@ class AmigoSolver(LinearSolver):
         )
         self._diag_indices = self._find_diag_indices(self.rowp, self.cols, self.nrows)
 
-        # Create the sparse LDL solver
         stype = SolverType.LDL
         self.ldl = SparseLDL(self.hess, stype, ustab, pivot_tol)
 
@@ -34,10 +42,10 @@ class AmigoSolver(LinearSolver):
             raise RuntimeError(f"am.SparseLDL factorization failed with flag = {flag}")
 
     def factor(self, alpha, x, diag, post_hessian=None):
-        """Assemble Hessian, add diagonal, and factorize (one shot).
+        """Assemble the Hessian, add the diagonal, and factorize in one shot.
 
-        Used for inertia-correction retries where we need a fresh
-        assembly (since add_diagonal_and_factor mutates self.hess).
+        Used during inertia-correction retries where we need a fresh
+        assembly before re-factorizing with a larger regularization.
         """
         self.problem.hessian(alpha, x, self.hess)
         if post_hessian is not None:
@@ -49,13 +57,30 @@ class AmigoSolver(LinearSolver):
         if flag != 0:
             raise RuntimeError(f"am.SparseLDL factorization failed with flag = {flag}")
 
+        # Debug print: factorization success flag + inertia counts.
+        # Useful when SparseLDL disagrees with the expected (n_primal+, n_dual-)
+        # signature during inertia correction.
+        npos, nneg = self.ldl.get_inertia()
+        print(
+            f"  [LDL] factor flag={flag}, npos={npos}, nneg={nneg}, total={npos+nneg}"
+        )
+
     def solve(self, bx, px):
-        """Solve the KKT system."""
+        """Solve K x = bx using the stored LDL factorization."""
         bx.copy_device_to_host()
+        b_arr = bx.get_array().copy()
         px.get_array()[:] = bx.get_array()[:]
         self.ldl.solve(px)
         px.copy_host_to_device()
 
+        # Debug print: RHS and solution infinity norms.
+        # A solution magnitude wildly larger than the RHS (or a residual
+        # norm close to ||x|| itself) is a sign that the solve is inaccurate.
+        px_arr = px.get_array()
+        b_nrm = np.max(np.abs(b_arr))
+        x_nrm = np.max(np.abs(px_arr))
+        print(f"  [LDL solve] ||b||_inf={b_nrm:.3e}, ||x||_inf={x_nrm:.3e}")
+
     def get_inertia(self):
-        """Return (n_positive, n_negative)"""
+        """Return (n_positive, n_negative) eigenvalue counts from the factorization."""
         return self.ldl.get_inertia()

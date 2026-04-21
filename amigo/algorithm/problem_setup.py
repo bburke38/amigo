@@ -11,6 +11,7 @@ from ..amigo import InteriorPointOptimizer
 from ..model import ModelVector
 
 from .solvers import (
+    AmigoSolver,
     DirectPetscSolver,
     DirectScipySolver,
     MumpsSolver,
@@ -86,6 +87,13 @@ class ProblemSetup:
                 self.solver = PardisoSolver(self.problem)
             elif solver_pref == "mumps":
                 self.solver = MumpsSolver(self.problem)
+            elif solver_pref == "amigo":
+                self.solver = AmigoSolver(self.problem)
+            else:
+                raise ValueError(
+                    f"Unknown solver string '{solver}'. "
+                    "Expected one of: 'scipy', 'pardiso', 'mumps', 'amigo'."
+                )
         elif solver is not None:
             self.solver = solver
         else:

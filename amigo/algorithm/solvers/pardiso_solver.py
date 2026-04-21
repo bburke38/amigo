@@ -1,10 +1,10 @@
-from . import LinearSolver
+from . import DirectSparseSolver
 import numpy as np
 from scipy.sparse import csr_matrix
 from amigo import MemoryLocation
 
 
-class PardisoSolver(LinearSolver):
+class PardisoSolver(DirectSparseSolver):
     """Sparse LDL^T solver via Intel MKL PARDISO with inertia detection.
 
     Uses symmetric indefinite factorization (mtype=-2) which provides

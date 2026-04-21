@@ -137,6 +137,7 @@ class NewtonDirection:
         to applying the default relaxation if the backend doesn't expose
         relaxed accessors.
         """
+        # TODO: move to backend: bounds should stay in C++ and the solver's iterative_refinement should fetch them itself instead
         if hasattr(self.optimizer, "get_lbx_relaxed"):
             lbx = np.array(self.optimizer.get_lbx_relaxed())
             ubx = np.array(self.optimizer.get_ubx_relaxed())

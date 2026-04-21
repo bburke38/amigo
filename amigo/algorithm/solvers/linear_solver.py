@@ -4,6 +4,10 @@ from scipy.sparse import csr_matrix
 
 
 class LinearSolver(ABC):
+    """
+    Minimal contract: any KKT solver.
+    """
+
     @abstractmethod
     def factor(self, alpha, x, diag):
         pass
@@ -18,6 +22,21 @@ class LinearSolver(ABC):
         raise NotImplementedError(
             "This solver does not support inertia queries"
         )  # TODO scipy need inertia
+
+
+# TODO: LinearSolver = "solves a system", DirectSparseSolver = "solves a system using an assembled CSR KKT matrix"
+
+
+class DirectSparseSolver(LinearSolver):
+    """Base class for direct solvers with an assembled CSR KKT matrix.
+
+    Subclasses must set in __init__:
+        self.problem         # the optimization problem
+        self.hess            # CSR matrix handle
+        self.rowp, self.cols # CSR structure arrays
+        self._diag_indices   # diagonal data-array indices
+
+    """
 
     def assemble_hessian(self, alpha, x):
         """Assemble Lagrangian Hessian and return its diagonal.

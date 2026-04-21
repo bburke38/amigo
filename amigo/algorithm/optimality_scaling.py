@@ -19,6 +19,7 @@ class OptimalityScaling:
 
     def _compute_optimality_scaling(self, mult_ind):
         """Compute optimality error scaling factors (s_d, s_c)."""
+        # TODO: move to backend: backend.optimality_scaling() that returns (s_d, s_c) without reading zl/zu/bounds from Python.
         s_max = 100.0
 
         # Bound multiplier sums: |z_L| + |z_U|
